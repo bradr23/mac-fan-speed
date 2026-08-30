@@ -503,9 +503,7 @@ private struct AboutSettings: View {
 
     var body: some View {
         VStack(spacing: 10) {
-            Image(systemName: "fan")
-                .font(.system(size: 40))
-                .foregroundStyle(.secondary)
+            AppIconImage(size: 72)
             Text("Mac Fan Speed").font(.title2.weight(.semibold))
             Text("Version \(Self.version)")
                 .font(.caption)

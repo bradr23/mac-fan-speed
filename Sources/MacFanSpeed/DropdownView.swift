@@ -34,8 +34,8 @@ struct DropdownView: View {
     // MARK: Header and readouts
 
     private var header: some View {
-        HStack {
-            Image(systemName: "fan")
+        HStack(spacing: 7) {
+            AppIconImage(size: 20)
             Text("Mac Fan Speed").font(.headline)
         }
     }
