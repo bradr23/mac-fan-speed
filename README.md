@@ -122,12 +122,19 @@ sudo ./build/fanctl auto     # return all fans to automatic control
 
 Sensor names and fan control differ between chip generations, and this has only been tested on one machine. If temperatures show as unavailable, look wrong, or fan control does not work, please [open an issue](https://github.com/bradr23/mac-fan-speed/issues) and include:
 
+`fanctl` ships inside the app, so you do not need to build anything:
+
 ```bash
-./build/fanctl temps --dump
-sudo ./build/fanctl probe-mode
+/Applications/MacFanSpeed.app/Contents/Resources/fanctl temps --dump
 ```
 
-The first lists every sensor your Mac exposes and how the app classified it — the same readings the app's **Settings → Sensors** tab shows. The second determines what your firmware will accept for fan control, and always restores your original settings afterwards. Between them they are usually enough to add support.
+```bash
+sudo /Applications/MacFanSpeed.app/Contents/Resources/fanctl probe-mode
+```
+
+(Built from source instead? Use `./build/fanctl` for both.)
+
+The first lists every sensor your Mac exposes and how the app classified it — the same readings the app's **Sensors** window shows. The second determines what your firmware will accept for fan control, and always restores your original settings afterwards. Between them they are usually enough to add support.
 
 ## How it works
 
