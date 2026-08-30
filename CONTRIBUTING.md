@@ -81,6 +81,31 @@ nothing more, so it becomes "Processor die 1" — not "CPU core 1", which would 
 a guess presented as fact. An unrecognised name shown verbatim is better than a
 plausible wrong one.
 
+## The app icon
+
+`Resources/AppIcon.png` is the master artwork. Rebuild everything derived from it
+with:
+
+```bash
+swift scripts/make-icon.swift
+```
+
+That writes `Resources/AppIcon.icns` for the app and `docs/icon.png` for the
+README, so the two cannot drift. Both are committed; the script only needs
+running when the artwork changes.
+
+Two things it does that are easy to miss when replacing the artwork:
+
+- **Insets to Apple's grid.** macOS puts an icon's shape in 824 points of a 1024
+  canvas and leaves the rest transparent for the system's shadow. Full-bleed
+  artwork looks oversized beside real apps in Finder. `MFS_ICON_SCALE=1` keeps
+  artwork that already has its own margin.
+- **Cuts the corners transparent.** Artwork exported without an alpha channel has
+  opaque black outside the rounded square, which reads as a black *square* on a
+  light background. Keying on the colour is not an option — this icon has
+  thousands of pure-black pixels in the middle of the design — so the corners are
+  cut geometrically. `MFS_ICON_CORNER=0` for artwork that is not a rounded square.
+
 ## Cutting a release
 
 Releases are built by CI, not by hand — nothing binary is ever committed to the

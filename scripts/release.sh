@@ -23,8 +23,8 @@ step() { printf '\n\033[1m==> %s\033[0m\n' "$1"; }
 step "Version $VERSION"
 
 # The icon is committed, so only regenerate it when asked or when it is missing.
-# Rendering needs AppKit, which is unreliable on a headless CI runner, and there
-# is no reason to redraw an unchanged icon on every release.
+# It is built from Resources/AppIcon.png with CoreGraphics, which works headless,
+# so this is now only about not redrawing an unchanged icon on every release.
 if [ "${1:-}" = "--regenerate-icon" ] || [ ! -f Resources/AppIcon.icns ]; then
     step "Regenerating the app icon"
     swift scripts/make-icon.swift

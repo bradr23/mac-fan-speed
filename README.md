@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/icon.png" alt="" width="128">
+</p>
+
 # Mac Fan Speed
 
 A free, open-source macOS menu bar app that shows your CPU temperature and fan speed, and lets you control the fans yourself.
