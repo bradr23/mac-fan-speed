@@ -81,6 +81,26 @@ nothing more, so it becomes "Processor die 1" — not "CPU core 1", which would 
 a guess presented as fact. An unrecognised name shown verbatim is better than a
 plausible wrong one.
 
+## Cutting a release
+
+Releases are built by CI, not by hand — nothing binary is ever committed to the
+repository.
+
+1. Bump `CFBundleShortVersionString` in `Resources/Info.plist` and
+   `SMCKit.version` in `Sources/SMCKit/SMCKit.swift`. They must match;
+   `scripts/release.sh` refuses to build if they disagree.
+2. Commit, then tag and push:
+
+   ```bash
+   git tag v0.2.0 && git push origin v0.2.0
+   ```
+
+`.github/workflows/release.yml` then builds on an Apple Silicon runner, checks
+the tag agrees with the bundle version, and publishes a GitHub release with the
+`.app` archive and its checksum attached.
+
+`scripts/release.sh` produces the same archive locally if you need one.
+
 ## Licence
 
 MIT. By contributing you agree your work ships under it.

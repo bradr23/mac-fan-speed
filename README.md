@@ -4,6 +4,9 @@ A free, open-source macOS menu bar app that shows your CPU temperature and fan s
 
 macOS keeps the fans off until the machine is already hot. That's fine for the hardware, but it makes a laptop uncomfortable on your lap. Mac Fan Speed lets you hold a gentle fan floor so the machine stays cool instead of warming up first and then spinning up loudly.
 
+[![Build and test](https://github.com/bradr23/mac-fan-speed/actions/workflows/ci.yml/badge.svg)](https://github.com/bradr23/mac-fan-speed/actions/workflows/ci.yml)
+[![Latest release](https://img.shields.io/github/v/release/bradr23/mac-fan-speed?label=download)](https://github.com/bradr23/mac-fan-speed/releases/latest)
+
 <img src="docs/menubar.png" alt="Temperature and fan speed in the menu bar" width="330">
 
 <img src="docs/dropdown.png" alt="The dropdown, showing temperature, per-fan speeds, history charts and mode buttons" width="300"> <img src="docs/sensors.png" alt="The Sensors window, listing every hardware temperature grouped by what it measures" width="300">
@@ -32,7 +35,9 @@ Fanless Macs such as the MacBook Air work in monitoring-only mode.
 
 ## Installing
 
-Download `MacFanSpeed-0.1.0.zip` from [Releases](https://github.com/bradr23/mac-fan-speed/releases), unzip it, and drag `MacFanSpeed.app` to your Applications folder.
+**[Download the latest release](https://github.com/bradr23/mac-fan-speed/releases/latest)** — grab `MacFanSpeed-<version>.zip`, unzip it, and drag `MacFanSpeed.app` to your Applications folder. No building required.
+
+Prefer to build it yourself? See [Building from source](#building-from-source) — it takes about ten seconds and avoids the Gatekeeper step below.
 
 ### First launch
 
@@ -47,6 +52,12 @@ xattr -dr com.apple.quarantine /Applications/MacFanSpeed.app
 ```
 
 Building from source avoids this entirely — locally built apps are never quarantined.
+
+Each release publishes a `.sha256` alongside the archive if you want to check the download:
+
+```bash
+shasum -a 256 MacFanSpeed-0.1.0.zip
+```
 
 ### Enabling fan control
 

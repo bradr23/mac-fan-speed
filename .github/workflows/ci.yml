@@ -1,0 +1,50 @@
+name: Build and test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    # Apple Silicon runner: this project is Apple Silicon only, and the SMC and
+    # sensor code will not even compile meaningfully elsewhere.
+    runs-on: macos-15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          swift --version
+          xcodebuild -version
+
+      - name: Build
+        run: ./scripts/build.sh release
+
+      - name: Test
+        # Only the hardware-independent logic runs here: sensor classification,
+        # naming, fan range maths, the failsafe state machine. Anything touching
+        # the SMC needs real hardware and is covered by scripts/verify-*.sh.
+        run: swift test
+
+      - name: Check the bundle is complete
+        # A release missing the embedded helper looks fine until someone tries to
+        # enable fan control on a machine that has never seen this repository.
+        run: |
+          for required in \
+            Contents/MacOS/MacFanSpeed \
+            Contents/Info.plist \
+            Contents/Resources/AppIcon.icns \
+            Contents/Resources/MacFanSpeedHelper \
+            Contents/Resources/fanctl \
+            Contents/Resources/install-helper.sh \
+            Contents/Resources/uninstall-helper.sh
+          do
+            if [ ! -e "build/MacFanSpeed.app/$required" ]; then
+              echo "::error::bundle is missing $required"
+              exit 1
+            fi
+          done
+          echo "all required files present"

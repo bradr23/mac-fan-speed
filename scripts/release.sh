@@ -22,8 +22,16 @@ step() { printf '\n\033[1m==> %s\033[0m\n' "$1"; }
 
 step "Version $VERSION"
 
-step "Regenerating the app icon"
-swift scripts/make-icon.swift
+# The icon is committed, so only regenerate it when asked or when it is missing.
+# Rendering needs AppKit, which is unreliable on a headless CI runner, and there
+# is no reason to redraw an unchanged icon on every release.
+if [ "${1:-}" = "--regenerate-icon" ] || [ ! -f Resources/AppIcon.icns ]; then
+    step "Regenerating the app icon"
+    swift scripts/make-icon.swift
+else
+    step "Using the committed app icon"
+    echo "    pass --regenerate-icon to redraw it"
+fi
 
 # A CLI or daemon reporting a different version from the app it shipped with is
 # the kind of thing nobody notices until a bug report is impossible to place.
