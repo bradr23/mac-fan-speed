@@ -31,9 +31,12 @@ let package = Package(
             name: "FanHelper",
             dependencies: ["SMCKit"],
             swiftSettings: langMode,
+            // No AppKit: a root daemon has no user session, so the AppKit
+            // notification centre it used to watch for sleep never delivered
+            // anything. IOKit's power notifications are the daemon equivalent.
             linkerSettings: [
                 .linkedFramework("Security"),
-                .linkedFramework("AppKit"),
+                .linkedFramework("IOKit"),
             ]
         ),
         // Debug CLI for exercising the SMC/sensor layer without the UI.

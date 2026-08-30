@@ -1,6 +1,7 @@
-import AppKit
 import Darwin
 import Foundation
+import IOKit
+import IOKit.pwr_mgt
 import Security
 import SMCKit
 
@@ -308,16 +309,78 @@ func installSignalHandlers() {
 
 var signalSources: [DispatchSourceSignal] = []
 
+/// Root port for the system power notifications, needed to acknowledge them.
+private var powerRootPort: io_connect_t = 0
+
+/// Power-management message codes.
+///
+/// `IOMessage.h` builds these with the `iokit_common_msg` macro, which Swift
+/// cannot import ("structure not supported"), so they are reconstructed here.
+/// The macro is `sys_iokit | sub_iokit_common | code`, where `sys_iokit` is
+/// `err_system(0x38)` — `0x38 << 26` — and `sub_iokit_common` is 0, giving the
+/// `0xE0000000` prefix.
+///
+/// Confirmed against the SDK rather than assumed, by compiling the real macros:
+///
+///     printf("0x%08X 0x%08X", kIOMessageCanSystemSleep, kIOMessageSystemWillSleep)
+///     // 0xE0000270 0xE0000280
+private enum PowerMessage {
+    private static let iokitCommon: UInt32 = 0xE000_0000
+    /// Idle sleep asking whether it may proceed. `0xE0000270`.
+    static let canSystemSleep = iokitCommon | 0x270
+    /// Sleep is happening; the system waits for an acknowledgement. `0xE0000280`.
+    static let systemWillSleep = iokitCommon | 0x280
+}
+
+/// Restore automatic control before the machine sleeps.
+///
+/// This must use IOKit rather than `NSWorkspace.willSleepNotification`.
+/// `NSWorkspace` notifications are delivered per *user session*, and a
+/// LaunchDaemon runs in the system domain with no session attached — the
+/// observer registers without error and is then never called. That is not a
+/// theory: the daemon logged a restore for every other exit path across weeks of
+/// use and not one for sleep, through many real sleep cycles.
+/// `IORegisterForSystemPower` is the session-independent equivalent and is what
+/// daemons are expected to use.
+///
+/// Answering `kIOMessageSystemWillSleep` also holds sleep off until the fans are
+/// actually released, which the notification-based version could never do even
+/// if it had fired.
 func observeSleep() {
-    NSWorkspace.shared.notificationCenter.addObserver(
-        forName: NSWorkspace.willSleepNotification,
-        object: nil,
-        queue: .main
-    ) { _ in
-        // Fan state does not survive sleep reliably; the app re-applies its
-        // target on wake.
-        FanService.shared.emergencyRestore(reason: "system going to sleep")
+    var notifyPort: IONotificationPortRef?
+    var notifier: io_object_t = 0
+
+    let callback: IOServiceInterestCallback = { _, _, messageType, messageArgument in
+        switch messageType {
+        case PowerMessage.canSystemSleep:
+            // Idle sleep asks permission first. Failing to answer stalls it for
+            // 30 s, so allow it — the real work happens on WillSleep below.
+            IOAllowPowerChange(powerRootPort, Int(bitPattern: messageArgument))
+
+        case PowerMessage.systemWillSleep:
+            // Sleep waits for the acknowledgement, so the fans are handed back
+            // before the machine goes down rather than racing it.
+            FanService.shared.emergencyRestore(reason: "system going to sleep")
+            IOAllowPowerChange(powerRootPort, Int(bitPattern: messageArgument))
+
+        default:
+            break
+        }
     }
+
+    powerRootPort = IORegisterForSystemPower(nil, &notifyPort, callback, &notifier)
+    guard powerRootPort != 0, let notifyPort else {
+        log("WARNING: could not register for sleep notifications; the watchdog "
+            + "remains the backstop")
+        return
+    }
+
+    CFRunLoopAddSource(
+        CFRunLoopGetMain(),
+        IONotificationPortGetRunLoopSource(notifyPort).takeUnretainedValue(),
+        .defaultMode
+    )
+    log("registered for system sleep notifications")
 }
 
 // MARK: - Entry point
