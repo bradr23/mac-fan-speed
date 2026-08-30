@@ -262,6 +262,10 @@ private struct HelperSettings: View {
             Section {
                 LabeledContent("Status") {
                     switch monitor.helper.status {
+                    case .ready(let version) where monitor.helper.isOutdated:
+                        Label("Running an older version (\(version))",
+                              systemImage: "exclamationmark.triangle")
+                            .foregroundStyle(.orange)
                     case .ready(let version):
                         Label("Installed and running (\(version))", systemImage: "checkmark.circle")
                             .foregroundStyle(.green)
@@ -278,6 +282,13 @@ private struct HelperSettings: View {
 
                 HStack {
                     if monitor.helper.status.isReady || installer.isInstalled {
+                        if monitor.helper.isOutdated {
+                            Button("Update Helper…") {
+                                installer.install { _ in monitor.helper.refreshStatus() }
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .disabled(!installer.isBundleComplete)
+                        }
                         Button("Remove Helper…") {
                             installer.uninstall { _ in monitor.helper.refreshStatus() }
                         }
@@ -292,6 +303,20 @@ private struct HelperSettings: View {
                     Button("Re-check") { monitor.helper.refreshStatus() }
 
                     if installer.isWorking { ProgressView().controlSize(.small) }
+                }
+
+                // Replacing MacFanSpeed.app leaves the root daemon behind at the
+                // version it was installed from, and it goes on answering
+                // normally, so nothing else would ever reveal the mismatch.
+                if monitor.helper.isOutdated, let installed = monitor.helper.status.version {
+                    InlineNote(
+                        icon: "arrow.triangle.2.circlepath",
+                        tint: .orange,
+                        text: "The background service is version \(installed), but this "
+                            + "app ships \(monitor.helper.bundledVersion). Updating the app "
+                            + "does not update the service. Choose Update Helper to bring "
+                            + "them into line."
+                    )
                 }
 
                 switch installer.lastResult {

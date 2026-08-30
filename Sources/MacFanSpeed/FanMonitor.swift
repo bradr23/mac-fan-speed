@@ -146,6 +146,10 @@ final class FanMonitor: ObservableObject {
         cpu = snapshot.cpuTemperature
         allSensors = snapshot.sensors
 
+        // A daemon that stopped answering blocks every control path, so keep
+        // testing it rather than waiting for someone to press "Re-check".
+        helper.retryIfUnreachable()
+
         restoreStartupModeIfNeeded()
         // Last, so nothing in this tick can re-enable manual behind its back.
         evaluateFailsafe(celsius: snapshot.cpuTemperature?.celsius)
@@ -240,6 +244,26 @@ final class FanMonitor: ObservableObject {
             helper.setAllAuto { [weak self] error in
                 if let error { self?.lastControlError = error }
             }
+        }
+    }
+
+    /// Take manual control at the current slider speed, following no preset.
+    ///
+    /// `setMode(.manual)` alone would leave any active preset selected, so the
+    /// Custom button would appear to do nothing while a preset was in force.
+    func setCustom() {
+        let previousPreset = activePresetID
+        activePresetID = nil
+        settings.selectedPresetID = nil
+
+        setMode(.manual)
+
+        // setMode refuses while the failsafe holds or the helper is missing.
+        // Put the preset back rather than leaving a selection the user can see
+        // but never asked for.
+        if mode != .manual {
+            activePresetID = previousPreset
+            settings.selectedPresetID = previousPreset
         }
     }
 

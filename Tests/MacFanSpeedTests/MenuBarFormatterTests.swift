@@ -70,12 +70,28 @@ final class MenuBarFormatterTests: XCTestCase {
         XCTAssertEqual(label, "--° 3.0k")
     }
 
-    func testStoppedFansReportZeroNotUnavailable() {
+    func testStoppedFansReadAsOffNotUnavailable() {
         // Fans genuinely at rest is different from fans being unreadable, and the
-        // label must distinguish them.
+        // label must distinguish them. This is also the commonest label on an
+        // idle Mac, so it says "off" rather than a bare "0" that reads like a
+        // truncated number.
         let label = MenuBarFormatter.label(
             celsius: 39, averageRPM: 0, hasFans: true, unit: .celsius
         )
-        XCTAssertEqual(label, "39° 0")
+        XCTAssertEqual(label, "39° off")
+
+        let unreadable = MenuBarFormatter.label(
+            celsius: 39, averageRPM: nil, hasFans: true, unit: .celsius
+        )
+        XCTAssertEqual(unreadable, "39° ----")
+        XCTAssertNotEqual(label, unreadable)
+    }
+
+    /// A fan barely turning is still running, and must not be reported as off.
+    func testBarelyTurningFansAreNotReportedAsOff() {
+        let label = MenuBarFormatter.label(
+            celsius: 39, averageRPM: 12, hasFans: true, unit: .celsius
+        )
+        XCTAssertEqual(label, "39° 12")
     }
 }

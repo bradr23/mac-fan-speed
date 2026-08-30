@@ -29,6 +29,13 @@ public enum MenuBarFormatter {
     /// The complete menu bar label.
     ///
     /// A Mac with no fans shows temperature alone rather than a fabricated zero.
+    ///
+    /// Fans that are stopped read "off" rather than "0". This is the state an
+    /// idle Mac sits in most of the time — macOS holds the fans off until the
+    /// machine is already warm, which is the whole reason this app exists — so it
+    /// is the label most users see most often, and a bare "0" beside a
+    /// temperature reads like a truncated number rather than a fan state. It
+    /// stays distinct from `----`, which means the speed could not be read at all.
     public static func label(
         celsius: Double?,
         averageRPM: Double?,
@@ -37,6 +44,7 @@ public enum MenuBarFormatter {
     ) -> String {
         let temp = temperature(celsius, unit: unit)
         guard hasFans else { return temp }
-        return "\(temp) \(rpm(averageRPM))"
+        guard let averageRPM, averageRPM < 1 else { return "\(temp) \(rpm(averageRPM))" }
+        return "\(temp) off"
     }
 }

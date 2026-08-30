@@ -25,6 +25,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var previewWindow: NSWindow?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        guard !terminateIfAlreadyRunning() else { return }
+
         FanMonitor.shared.start()
 
         if ProcessInfo.processInfo.environment["MFS_SELFTEST"] == "1" {
@@ -64,6 +66,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
         }
+    }
+
+    /// Quit immediately if another copy is already running.
+    ///
+    /// Two instances is not hypothetical. The login item launches the app by
+    /// path, so a copy left in Downloads and a copy in Applications are distinct
+    /// as far as LaunchServices is concerned and both will start. The result is
+    /// two menu bar icons and, worse, two controllers driving the same daemon:
+    /// one sends its target every two seconds while the other tries to release
+    /// the fans, so quitting one appears to do nothing.
+    ///
+    /// The environment check keeps the test entry points usable, since those are
+    /// deliberately run alongside a normal copy of the app.
+    private func terminateIfAlreadyRunning() -> Bool {
+        let environment = ProcessInfo.processInfo.environment
+        let isTestRun = environment.keys.contains { $0.hasPrefix("MFS_") }
+        guard !isTestRun, let identifier = Bundle.main.bundleIdentifier else { return false }
+
+        let ourPID = ProcessInfo.processInfo.processIdentifier
+        let others = NSRunningApplication
+            .runningApplications(withBundleIdentifier: identifier)
+            .filter { $0.processIdentifier != ourPID }
+        guard let existing = others.first else { return false }
+
+        let message = "MacFanSpeed: already running as pid "
+            + "\(existing.processIdentifier); this copy is exiting.\n"
+        FileHandle.standardError.write(Data(message.utf8))
+        NSApp.terminate(nil)
+        return true
     }
 
     /// Exercise the app's own control path end to end: enter manual mode, hold a

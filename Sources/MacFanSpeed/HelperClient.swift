@@ -15,11 +15,51 @@ final class HelperClient: ObservableObject {
         case ready(version: String)
 
         var isReady: Bool { if case .ready = self { return true }; return false }
+
+        var version: String? {
+            if case .ready(let version) = self { return version }
+            return nil
+        }
     }
 
     @Published private(set) var status: Status = .checking
 
+    /// The daemon is running a different build from this app.
+    ///
+    /// Updating the app means replacing `MacFanSpeed.app`. The daemon lives in
+    /// `/usr/local/libexec` and is untouched by that, so it keeps running the
+    /// version it was installed from — indefinitely, and silently, since it
+    /// answers every request exactly as before. Anyone who updates the app and
+    /// wonders why a fixed bug is still there would have no way to tell.
+    ///
+    /// Compared against `SMCKit.version` because that constant is compiled into
+    /// both the app and the helper it ships with, and `scripts/release.sh`
+    /// checks it against the bundle version.
+    var isOutdated: Bool {
+        Self.isOutdated(installed: status.version, bundled: SMCKit.version)
+    }
+
+    /// Split out so the comparison is testable without a running daemon.
+    ///
+    /// A nil installed version means the daemon is missing or not answering,
+    /// which is a different problem with its own message — reporting it as
+    /// "out of date" as well would send the user to the wrong button.
+    static func isOutdated(installed: String?, bundled: String) -> Bool {
+        guard let installed else { return false }
+        return installed != bundled
+    }
+
+    /// Version this app would install, for the "installed X, bundled Y" message.
+    var bundledVersion: String { SMCKit.version }
+
     private var connection: NSXPCConnection?
+
+    /// When the status was last re-checked after the daemon stopped answering.
+    /// A transient failure otherwise left the app stuck: `sendTargets` refuses to
+    /// run unless the helper is ready, and nothing re-tested it, so fan control
+    /// stayed dead until the user found "Re-check" in Settings.
+    private var lastUnreachableRetry: Date?
+    private static let unreachableRetryInterval: TimeInterval = 10
 
     // MARK: Connection
 
@@ -63,6 +103,25 @@ final class HelperClient: ObservableObject {
         }
     }
 
+    /// Re-test a daemon that stopped answering, at most every few seconds.
+    ///
+    /// Called from the poll loop so the app recovers on its own from a daemon
+    /// that was restarted, reinstalled, or briefly unreachable, instead of
+    /// waiting for someone to open Settings and press "Re-check".
+    func retryIfUnreachable() {
+        guard case .unreachable = status else {
+            lastUnreachableRetry = nil
+            return
+        }
+        let now = Date()
+        if let last = lastUnreachableRetry,
+           now.timeIntervalSince(last) < Self.unreachableRetryInterval {
+            return
+        }
+        lastUnreachableRetry = now
+        refreshStatus()
+    }
+
     // MARK: Commands
 
     func setFan(index: Int, rpm: Double, completion: @escaping (String?) -> Void = { _ in }) {
@@ -83,10 +142,6 @@ final class HelperClient: ObservableObject {
         proxy.setAllAuto { error in
             Task { @MainActor in completion(error) }
         }
-    }
-
-    func heartbeat() {
-        proxy()?.heartbeat { _ in }
     }
 
     /// Blocking restore for the quit path.

@@ -171,8 +171,8 @@ struct DropdownView: View {
         }
     }
 
-    /// Auto plus one button per preset. Presets are percentages of each fan's own
-    /// range, so the same button means the right thing on any Mac.
+    /// Auto, one button per preset, and Custom. Presets are percentages of each
+    /// fan's own range, so the same button means the right thing on any Mac.
     private var presetButtons: some View {
         VStack(alignment: .leading, spacing: 4) {
             Text("Mode").font(.subheadline.weight(.medium))
@@ -185,12 +185,24 @@ struct DropdownView: View {
                         monitor.apply(preset: preset)
                     }
                 }
+                // Without this the slider is the only way to set a speed by hand,
+                // and it is disabled outside manual mode — so the only route in
+                // was to pick a preset and then notice that moving the slider
+                // stayed in manual. This names the state the slider already had.
+                modeButton(title: "Custom", isSelected: isCustomSelected) {
+                    monitor.setCustom()
+                }
             }
         }
     }
 
     private func isSelected(_ preset: FanPreset) -> Bool {
         monitor.mode == .manual && monitor.activePresetID == preset.id
+    }
+
+    /// Manual control that is not following any preset.
+    private var isCustomSelected: Bool {
+        monitor.mode == .manual && monitor.activePresetID == nil
     }
 
     private func modeButton(
@@ -285,6 +297,20 @@ struct DropdownView: View {
     @ViewBuilder
     private var helperBanner: some View {
         switch monitor.helper.status {
+        case .ready where monitor.helper.isOutdated:
+            // Fan control still works — the daemon is simply older than the app,
+            // which replacing MacFanSpeed.app never updates. Worth one line here
+            // because someone who updates and never opens Settings would
+            // otherwise keep running the old service forever.
+            Button {
+                SettingsWindowController.shared.show(tab: .helper)
+            } label: {
+                Label("Background service is out of date", systemImage: "arrow.triangle.2.circlepath")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            }
+            .buttonStyle(.plain)
+
         case .ready:
             EmptyView()
 
