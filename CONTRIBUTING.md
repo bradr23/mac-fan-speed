@@ -86,10 +86,18 @@ plausible wrong one.
 Releases are built by CI, not by hand — nothing binary is ever committed to the
 repository.
 
-1. Bump `CFBundleShortVersionString` in `Resources/Info.plist` and
-   `SMCKit.version` in `Sources/SMCKit/SMCKit.swift`. They must match;
-   `scripts/release.sh` refuses to build if they disagree.
-2. Commit, then tag and push:
+1. Bump `CFBundleShortVersionString` and `CFBundleVersion` in
+   `Resources/Info.plist` and `SMCKit.version` in `Sources/SMCKit/SMCKit.swift`.
+   The short version and `SMCKit.version` must match; `scripts/release.sh`
+   refuses to build if they disagree.
+
+   `SMCKit.version` is also what the app compares against the installed daemon to
+   detect a stale helper, so bumping it is what makes existing users see the
+   **Update Helper** prompt. Do not leave it behind.
+2. Add a `## <version>` section to `CHANGELOG.md`. The release workflow copies it
+   into the release notes; without it the release publishes with install
+   boilerplate only and the build logs a warning.
+3. Commit, then tag and push:
 
    ```bash
    git tag v0.2.0 && git push origin v0.2.0

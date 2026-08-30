@@ -51,7 +51,21 @@ jobs:
           VERSION="${{ steps.version.outputs.version }}"
           SHA="$(cut -d' ' -f1 < "dist/MacFanSpeed-$VERSION.zip.sha256")"
 
-          cat > notes.md <<NOTES
+          # Lead with this version's CHANGELOG entry, so the release page says
+          # what changed rather than only how to install. Missing entry is not
+          # fatal: better a release with boilerplate notes than no release.
+          : > notes.md
+          if awk -v v="## $VERSION" '
+                $0 == v {found = 1; next}
+                found && /^## / {exit}
+                found {print}
+              ' CHANGELOG.md > changes.md && [ -s changes.md ]; then
+            cat changes.md >> notes.md
+          else
+            echo "::warning::no CHANGELOG.md section for $VERSION"
+          fi
+
+          cat >> notes.md <<NOTES
           ## Install
 
           1. Download **MacFanSpeed-$VERSION.zip** below and unzip it.

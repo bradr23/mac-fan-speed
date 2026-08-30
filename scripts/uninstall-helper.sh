@@ -41,7 +41,9 @@ launchctl bootout "system/$LABEL" 2>/dev/null || true
 sleep 1
 
 echo "==> removing files"
-rm -f "$PLIST_DST" "$BIN_DST"
+# The log too: "Remove Helper" should leave nothing of the daemon behind, and a
+# root-owned file in /var/log is exactly the sort of leftover nobody finds later.
+rm -f "$PLIST_DST" "$BIN_DST" /var/log/MacFanSpeedHelper.log
 
 echo ""
 if launchctl print "system/$LABEL" >/dev/null 2>&1; then

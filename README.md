@@ -71,6 +71,14 @@ Without the helper the app still shows temperatures and fan speeds — you just 
 
 **Settings → General → Start Mac Fan Speed at login.** Move the app to your Applications folder first: a login item records where the app is at the moment you enable it, and moving it afterwards leaves a stale entry.
 
+### Updating
+
+Replace `MacFanSpeed.app` with the new version, keeping the same location. Your settings and presets are kept.
+
+One thing to know: replacing the app does **not** update the background fan-control service, which lives outside the app bundle and keeps running the version it was installed from. The app notices and tells you — **Settings → Fan Control** shows *Running an older version* with an **Update Helper…** button. Monitoring and fan control keep working in the meantime.
+
+Keep only one copy of the app. Two copies in different folders both start, both show a menu bar icon, and both try to drive the fans; newer versions detect this and the second copy exits.
+
 ## Safety
 
 Holding fans **slower** than macOS would choose can let the machine run hotter than Apple intends. These protections are not optional and cannot be turned off:
@@ -78,7 +86,7 @@ Holding fans **slower** than macOS would choose can let the machine run hotter t
 - If the CPU reaches **95 °C**, the fans return to macOS control immediately and stay there until the machine drops below 85 °C.
 - If temperature readings become unavailable while fans are under manual control, the app hands them back rather than holding a speed blind.
 - If the app crashes or is force-quit, the background service returns the fans to macOS within a few seconds — measured at 3 seconds on the development machine.
-- Quitting, sleeping, or removing the helper all restore automatic control.
+- Quitting, sleeping, or removing the helper all restore automatic control. Sleep waits for the fans to be handed back before the machine goes down.
 
 Apple Silicon Macs also throttle themselves in hardware regardless of fan speed. That said, this software comes with no warranty; see [LICENSE](LICENSE).
 
@@ -131,6 +139,10 @@ From the M3 generation onward, `thermalmonitord` holds the fans and the firmware
 
 - [exelban/stats](https://github.com/exelban/stats) (MIT) — reference for Apple Silicon fan control
 - [narugit/smctemp](https://github.com/narugit/smctemp) — reference for M-series temperature sensors
+
+## Changes
+
+See [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 
