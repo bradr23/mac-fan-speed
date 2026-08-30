@@ -38,6 +38,10 @@ final class FanService {
     /// a fan again. See `shutdownAndRestore`.
     private var isShuttingDown = false
 
+    /// Live XPC connections. The fans are released when this reaches zero, not on
+    /// every disconnect — see `clientDisconnected`.
+    private var activeClients = 0
+
     private init() {}
 
     func start() {
@@ -118,6 +122,37 @@ final class FanService {
     /// writes fail for their entire retry window and leaves the fans forced.
     func emergencyRestore(reason: String) {
         queue.sync { performRestore(reason: reason) }
+    }
+
+    // MARK: Client tracking
+
+    /// Register an accepted client. Must be paired with `clientDisconnected`.
+    func clientConnected() {
+        queue.sync { activeClients += 1 }
+    }
+
+    /// Release the fans, but only once *every* client has gone.
+    ///
+    /// Restoring on any disconnect is wrong whenever more than one client exists,
+    /// and more than one is routine: every `fanctl` invocation opens its own
+    /// connection, and the diagnostics this project asks people to run in bug
+    /// reports are `fanctl` commands. Running `fanctl helper-status` while a
+    /// preset was active used to knock the fans straight back to automatic — the
+    /// app was still connected and still sending its target, but a short-lived
+    /// second client had just exited.
+    ///
+    /// The watchdog is unaffected and remains the backstop for a client that dies
+    /// without its connection being torn down.
+    func clientDisconnected() {
+        queue.sync {
+            activeClients = max(0, activeClients - 1)
+            guard activeClients == 0 else {
+                log("a client disconnected; \(activeClients) still connected, "
+                    + "keeping fan control")
+                return
+            }
+            performRestore(reason: "last client disconnected")
+        }
     }
 
     /// Restore, then refuse to force anything again. For paths that end in
@@ -217,8 +252,13 @@ final class ListenerDelegate: NSObject, NSXPCListenerDelegate {
 
         // The app going away is one of the paths that must end in automatic fans.
         // The watchdog would catch it too; this just makes it immediate.
+        //
+        // Counted rather than acted on directly: a `fanctl` command run alongside
+        // the app is a second client, and its exit must not release fans the app
+        // is still holding.
+        FanService.shared.clientConnected()
         connection.invalidationHandler = {
-            FanService.shared.emergencyRestore(reason: "client disconnected")
+            FanService.shared.clientDisconnected()
         }
         connection.resume()
         return true

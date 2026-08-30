@@ -41,6 +41,14 @@ Bug fixes found while reviewing 0.1.0 for wider release.
   could report was "Couldn't communicate with a helper application", which looks
   like a broken install and sends you to reinstall the helper, which does not
   help. The app now recognises the situation and says to quit and reopen it.
+- **Any second client disconnecting released the fans.** The daemon restored
+  automatic control whenever *a* client went away, not when the last one did.
+  Every `fanctl` command opens its own connection, so running
+  `fanctl helper-status` — one of the diagnostics this project asks people to
+  paste into bug reports — knocked the fans back to automatic while the app was
+  still connected and still holding a preset. The daemon now counts its clients
+  and restores only when none are left; the watchdog is unchanged and still
+  covers a client that dies without tearing its connection down.
 - **A request arriving mid-shutdown could re-force the fans.** The app re-sends
   its target every two seconds, including while the daemon is stopping. Those
   requests queued behind the restore and were then honoured *after* it, setting
