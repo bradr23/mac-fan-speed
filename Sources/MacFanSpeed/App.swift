@@ -242,6 +242,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             monitor.settings.refreshLoginItemState()
             out += "selftest.loginItem: \(monitor.settings.loginItemState)\n"
             out += "selftest.helper: \(monitor.helper.status)\n"
+            out += "selftest.replacedWhileRunning: "
+                + "\(AppCodeIdentity.wasReplacedWhileRunning)\n"
             out += "selftest.bundle: \(Bundle.main.bundlePath)\n"
             if let error = monitor.startupError {
                 out += "selftest.startupError: \(error)\n"

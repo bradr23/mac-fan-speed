@@ -272,6 +272,9 @@ private struct HelperSettings: View {
                     case .notInstalled:
                         Label("Not installed", systemImage: "lock")
                             .foregroundStyle(.secondary)
+                    case .unreachable where monitor.helper.needsRelaunch:
+                        Label("Needs a restart of this app", systemImage: "arrow.clockwise")
+                            .foregroundStyle(.orange)
                     case .unreachable(let reason):
                         Label("Not responding — \(reason)", systemImage: "exclamationmark.triangle")
                             .foregroundStyle(.orange)
@@ -303,6 +306,22 @@ private struct HelperSettings: View {
                     Button("Re-check") { monitor.helper.refreshStatus() }
 
                     if installer.isWorking { ProgressView().controlSize(.small) }
+                }
+
+                // Replacing the app while it runs leaves this process signed
+                // differently from the bundle it came from, which is what the
+                // daemon checks. Reinstalling the helper does not help and is
+                // the obvious thing to try, so say what does.
+                if monitor.helper.needsRelaunch {
+                    InlineNote(
+                        icon: "arrow.clockwise",
+                        tint: .orange,
+                        text: "Mac Fan Speed was replaced while it was running, so the "
+                            + "background service no longer recognises it. Quit and reopen "
+                            + "the app — nothing else needs fixing, and your fans are "
+                            + "under macOS control in the meantime.",
+                        action: ("Quit Mac Fan Speed", { NSApplication.shared.terminate(nil) })
+                    )
                 }
 
                 // Replacing MacFanSpeed.app leaves the root daemon behind at the

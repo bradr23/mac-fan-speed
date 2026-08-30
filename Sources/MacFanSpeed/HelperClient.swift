@@ -52,6 +52,16 @@ final class HelperClient: ObservableObject {
     /// Version this app would install, for the "installed X, bundled Y" message.
     var bundledVersion: String { SMCKit.version }
 
+    /// The daemon is refusing this process because the app was replaced under it.
+    ///
+    /// Checked only when the connection is already failing: the underlying test
+    /// is a code-signature validation, and there is no reason to pay for it while
+    /// everything works.
+    var needsRelaunch: Bool {
+        guard case .unreachable = status else { return false }
+        return AppCodeIdentity.wasReplacedWhileRunning
+    }
+
     private var connection: NSXPCConnection?
 
     /// When the status was last re-checked after the daemon stopped answering.

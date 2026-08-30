@@ -33,6 +33,14 @@ Bug fixes found while reviewing 0.1.0 for wider release.
   so the reinstall raced its own shutdown — the busier the daemon, the more
   certain the failure. The installer now waits for the old job to actually go,
   and retries.
+- **Replacing the app while it was running broke fan control with no usable
+  explanation.** That is the ordinary way people update a Mac app — drag the new
+  version in, choose Replace, carry on — and it leaves the old process running
+  against a bundle that is no longer its own. The daemon validates its client's
+  code signature and rejects it with `errSecCSStaticCodeChanged`, so all the app
+  could report was "Couldn't communicate with a helper application", which looks
+  like a broken install and sends you to reinstall the helper, which does not
+  help. The app now recognises the situation and says to quit and reopen it.
 - **A request arriving mid-shutdown could re-force the fans.** The app re-sends
   its target every two seconds, including while the daemon is stopping. Those
   requests queued behind the restore and were then honoured *after* it, setting

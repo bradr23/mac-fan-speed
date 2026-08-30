@@ -334,6 +334,19 @@ struct DropdownView: View {
             }
             .fixedSize(horizontal: false, vertical: true)
 
+        case .unreachable where monitor.helper.needsRelaunch:
+            VStack(alignment: .leading, spacing: 3) {
+                Label("Quit and reopen Mac Fan Speed", systemImage: "arrow.clockwise")
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.orange)
+                Text("The app was replaced while it was running, so the background "
+                     + "service no longer recognises it. Your fans are under macOS "
+                     + "control until you reopen it.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+            .fixedSize(horizontal: false, vertical: true)
+
         case .unreachable(let reason):
             VStack(alignment: .leading, spacing: 3) {
                 Label("Helper not responding", systemImage: "exclamationmark.triangle")
