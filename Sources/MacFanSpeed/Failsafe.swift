@@ -1,4 +1,5 @@
 import Foundation
+import SMCKit
 
 /// Everything the failsafe judges a tick on.
 ///
@@ -36,26 +37,18 @@ struct Failsafe {
 
     // MARK: Thresholds
 
-    /// **Not a measurement.** Apple has never published a junction temperature
-    /// for any M-series chip, and nothing on the machine exposes one: all 3222
-    /// SMC keys on a Mac16,8 were enumerated and none is a limit. The most
-    /// convincing candidate found — `mlTJ`/`mlTj`, reading 100.00, with `Tj` the
-    /// industry notation for junction temperature — turned out to be element ten
-    /// of a twelve-entry percentage table whose siblings are `mlT0…mlT3`,
-    /// `mlTI…mlTL`, `mlTi…mlTl`. In a namespace of four-character keys there
-    /// will always be letters that spell something thermal.
-    ///
-    /// So this is an assumption, and it is named like one. 100 is chosen because
-    /// the ceiling below then lands exactly on the threshold this app has always
-    /// shipped, making the setting behaviour-neutral. Do not raise it.
-    static let assumedCriticalCelsius: Double = 100
+    /// The assumed critical point and the ceiling derived from it now live in
+    /// `SMCKit.ThermalLimits`, because the **daemon** needs them too and must not
+    /// take a threshold from a client. See that type for why the number is an
+    /// assumption rather than a reading.
+    static var assumedCriticalCelsius: Double { ThermalLimits.assumedCriticalCelsius }
 
-    /// The highest cutoff a user can choose: five degrees below the assumed
-    /// critical point. There is no code path that produces a higher trip.
-    static let maximumTripCelsius: Double = assumedCriticalCelsius - 5
-    static let minimumTripCelsius: Double = 60
-    static let defaultTripCelsius: Double = maximumTripCelsius
-    static let hysteresisCelsius: Double = 10
+    /// The highest cutoff a user can choose. There is no code path producing a
+    /// higher trip, and the daemon enforces the same ceiling independently.
+    static var maximumTripCelsius: Double { ThermalLimits.maximumTripCelsius }
+    static var minimumTripCelsius: Double { ThermalLimits.minimumTripCelsius }
+    static var defaultTripCelsius: Double { ThermalLimits.maximumTripCelsius }
+    static var hysteresisCelsius: Double { ThermalLimits.hysteresisCelsius }
 
     static var settableRange: ClosedRange<Double> {
         minimumTripCelsius...maximumTripCelsius
@@ -89,8 +82,7 @@ struct Failsafe {
     /// `min(max(.nan, lo), hi)` is `nan` in Swift: every comparison against nan
     /// is false, so a naive clamp passes it straight through.
     static func clampTrip(_ value: Double) -> Double {
-        guard value.isFinite else { return defaultTripCelsius }
-        return Swift.min(Swift.max(value, minimumTripCelsius), maximumTripCelsius)
+        ThermalLimits.clampTrip(value)
     }
 
     /// Adopt a changed user setting without losing an in-flight trip.

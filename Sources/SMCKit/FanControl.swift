@@ -47,6 +47,8 @@ public enum FanControlError: Error, CustomStringConvertible {
     case writeRejected(String, UInt8)
     case noBaselineRecorded(Int)
     case implausibleRange(Int, Double, Double)
+    case limitsUnknown(Int)
+    case invalidTarget(Int, Double)
 
     public var description: String {
         switch self {
@@ -61,8 +63,17 @@ public enum FanControlError: Error, CustomStringConvertible {
         case .noBaselineRecorded(let i):
             return "No automatic-mode baseline recorded for fan \(i); refusing to guess a value."
         case .implausibleRange(let i, let low, let high):
-            return "Fan \(i) reports an implausible range (\(Int(low))–\(Int(high)) rpm); "
-                 + "refusing to drive it."
+            // Formatted without Int(): these values reached here precisely
+            // because they are untrustworthy, and Int(Double.nan) traps.
+            return String(
+                format: "Fan %d reports an implausible range (%.0f–%.0f rpm); "
+                      + "refusing to drive it.", i, low, high
+            )
+        case .limitsUnknown(let i):
+            return "Fan \(i) does not report its speed limits, so it cannot be "
+                 + "driven safely."
+        case .invalidTarget(let i, let rpm):
+            return String(format: "Fan %d was given an invalid target (%f).", i, rpm)
         }
     }
 }
@@ -189,8 +200,24 @@ public final class FanController: @unchecked Sendable {
 
         captureBaseline()
 
+        // Rejected before the clamp, not after: `min(max(rpm, lo), hi)` is
+        // NaN-transparent, because every comparison against nan is false. A
+        // non-finite target therefore survives clamping, reaches the SMC, and
+        // then traps the first `Int(...)` that formats it — killing a root
+        // process. This is the boundary where untrusted numbers stop.
+        guard rpm.isFinite else {
+            throw FanControlError.invalidTarget(fanIndex, rpm)
+        }
+
         guard let fan = fanReader.read(index: fanIndex) else {
             throw FanControlError.invalidFanIndex(fanIndex)
+        }
+
+        // A fan whose limits the SMC never published has no trustworthy floor,
+        // and the clamp is the only thing standing between a request and a
+        // stopped fan.
+        guard fan.limitsReported else {
+            throw FanControlError.limitsUnknown(fanIndex)
         }
 
         // Clamp to this fan's own limits. Never trust a caller's range.

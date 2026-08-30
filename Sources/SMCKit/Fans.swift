@@ -14,6 +14,16 @@ public struct Fan: Identifiable, Equatable, Sendable {
     public let maxRPM: Double
     /// Speed the SMC is currently aiming for.
     public let targetRPM: Double
+    /// Whether the SMC actually reported this fan's minimum and maximum.
+    ///
+    /// A missing limit key used to read as 0, which is indistinguishable from a
+    /// fan that genuinely reports a floor of zero — and a floor of zero means a
+    /// clamp that permits stopping the fan outright. The limits are advisory
+    /// anyway (the SMC has been observed accepting targets outside them), so the
+    /// clamp is the real protection and it cannot be built on a guess. A fan
+    /// whose limits are unknown is reported, but never driven.
+    public let limitsReported: Bool
+
     /// Raw value of `F{i}Md`.
     ///
     /// Mode semantics are not the documented 0 = auto / 1 = forced on Apple
@@ -32,7 +42,8 @@ public struct Fan: Identifiable, Equatable, Sendable {
         minRPM: Double,
         maxRPM: Double,
         targetRPM: Double,
-        modeRaw: Double
+        modeRaw: Double,
+        limitsReported: Bool = true
     ) {
         self.index = index
         self.actualRPM = actualRPM
@@ -40,6 +51,7 @@ public struct Fan: Identifiable, Equatable, Sendable {
         self.maxRPM = maxRPM
         self.targetRPM = targetRPM
         self.modeRaw = modeRaw
+        self.limitsReported = limitsReported
     }
 
     /// Where `rpm` sits in this fan's range, 0...1. Presets are stored as
@@ -78,7 +90,7 @@ public struct FanReader: Sendable {
 
     /// Upper bound on fan indices to probe. No Mac comes close to this; it exists
     /// so a machine reporting a nonsense `FNum` cannot spin here indefinitely.
-    static let maximumFanIndex = 16
+    public static let maximumFanIndex = 16
 
     /// Read every fan. Returns an empty array on fanless hardware.
     ///
@@ -105,8 +117,13 @@ public struct FanReader: Sendable {
         // A fan without a readable current speed is not usable.
         guard let actual = smc.readNumber("F\(index)Ac") else { return nil }
 
-        let minRPM = smc.readNumber("F\(index)Mn") ?? 0
-        let maxRPM = smc.readNumber("F\(index)Mx") ?? 0
+        // Tracked rather than defaulted: `?? 0` turned an unreadable limit into a
+        // legitimate-looking floor of zero, which would let a fan be commanded to
+        // a full stop on hardware that simply does not publish the key.
+        let reportedMin = smc.readNumber("F\(index)Mn")
+        let reportedMax = smc.readNumber("F\(index)Mx")
+        let minRPM = reportedMin ?? 0
+        let maxRPM = reportedMax ?? 0
         let target = smc.readNumber("F\(index)Tg") ?? actual
         // Mode is spelled lowercase on some hardware; try both before giving up.
         let mode = smc.readNumber("F\(index)Md") ?? smc.readNumber("F\(index)md") ?? 0
@@ -117,7 +134,8 @@ public struct FanReader: Sendable {
             minRPM: minRPM,
             maxRPM: maxRPM,
             targetRPM: target,
-            modeRaw: mode
+            modeRaw: mode,
+            limitsReported: reportedMin != nil && reportedMax != nil
         )
     }
 

@@ -17,7 +17,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 FANCTL="$ROOT/build/fanctl"
 APP="$ROOT/build/MacFanSpeed.app/Contents/MacOS/MacFanSpeed"
-FAILSAFE_SRC="Sources/MacFanSpeed/Failsafe.swift"
+FAILSAFE_SRC="Sources/SMCKit/ThermalLimits.swift"
 PASS=0; FAIL=0
 
 green() { printf '\033[32m%s\033[0m\n' "$1"; }
@@ -87,6 +87,14 @@ TRIP=$(( IDLE - 3 ))
 RESET=$(( IDLE - 5 ))
 echo "Idle is ${IDLE} °C; tripping at ${TRIP} °C so it fires immediately"
 
+# A previous run that was SIGKILLed leaves the tainted source in place and its
+# pristine copy in .orig. Copying over that backup would destroy the only good
+# copy and bake a below-idle ceiling into the daemon payload the installer ships.
+if [ -f "$FAILSAFE_SRC.orig" ]; then
+    red "$FAILSAFE_SRC.orig already exists — a previous run did not finish."
+    red "Restore it first:  mv $FAILSAFE_SRC.orig $FAILSAFE_SRC && ./scripts/build.sh release"
+    exit 1
+fi
 cp "$FAILSAFE_SRC" "$FAILSAFE_SRC.orig"
 
 # The trip point is derived: maximumTrip = assumedCritical - 5, and the default

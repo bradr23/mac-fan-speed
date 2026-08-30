@@ -442,12 +442,31 @@ final class FanMonitor: ObservableObject {
 
     private func sendTargets() {
         guard mode == .manual, helper.status.isReady else { return }
-        for fan in fans {
+        let batch = controllableFans
+        guard !batch.isEmpty else { return }
+
+        // Collected across the whole round rather than assigned per fan. Each
+        // reply used to overwrite the last, so on a multi-fan Mac one fan's
+        // success erased another fan's failure and the user saw nothing wrong —
+        // which would have hidden the refusal a fan with unreadable limits now
+        // produces. The report is published once every fan has answered.
+        var errors: [Int: String] = [:]
+        var replies = 0
+
+        for fan in batch {
             helper.setFan(index: fan.index, rpm: target(for: fan)) { [weak self] error in
-                // Clear on success as well as setting on failure: a transient
-                // error used to stay on screen indefinitely once shown, long
+                guard let self else { return }
+                replies += 1
+                if let error { errors[fan.index] = error }
+                guard replies == batch.count else { return }
+
+                // Clearing on an all-clear round matters as much as reporting:
+                // a transient error used to stay on screen indefinitely, long
                 // after the fans were doing exactly what was asked.
-                self?.lastControlError = error
+                self.lastControlError = errors.isEmpty ? nil : errors
+                    .sorted { $0.key < $1.key }
+                    .map { batch.count > 1 ? "Fan \($0.key + 1): \($0.value)" : $0.value }
+                    .joined(separator: "  ")
             }
         }
     }
@@ -525,6 +544,11 @@ final class FanMonitor: ObservableObject {
     // MARK: Formatting
 
     var hasFans: Bool { !fans.isEmpty }
+
+    /// Fans the daemon will actually accept a target for. A fan whose limits the
+    /// SMC never reported is shown and monitored, but never driven.
+    var controllableFans: [Fan] { fans.filter(\.limitsReported) }
+    var hasControllableFans: Bool { !controllableFans.isEmpty }
 
     var averageRPM: Double? {
         guard !fans.isEmpty else { return nil }

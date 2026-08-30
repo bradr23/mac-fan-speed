@@ -2,6 +2,72 @@
 
 Notable changes in each release. Versions follow [semantic versioning](https://semver.org).
 
+## 0.4.0
+
+Security audit of 0.3.0, and its fixes. No privilege escalation was found; the
+issues were that the safety architecture sat on the wrong side of its own trust
+boundary, and that the daemon's client check was weaker than documented.
+
+### Fixed
+
+- **The privileged daemon now runs its own failsafe.** Every thermal protection
+  used to live in the app — the cutoff, the escalation floor, the battery,
+  storage and dwell rules — while the daemon, which is the trust boundary and
+  explicitly does not trust the app, never read a temperature at all. It clamped
+  a requested speed to the fan's range and nothing else. Any process that could
+  reach the Mach service could therefore pin the fans at minimum indefinitely,
+  heartbeating to defeat the 15-second watchdog, with no temperature check
+  anywhere in the privileged process. The daemon now reads its own temperatures
+  on its own timer against a ceiling compiled into `ThermalLimits`, and refuses
+  to force a fan while it is hot. Nothing about it depends on a client.
+- **Fan ownership is per-connection.** The heartbeat checked only whether *any*
+  fan was forced, so any accepted connection could keep another client's fans
+  alive forever; and releasing only when the *last* client disconnected let an
+  unrelated connection hold someone else's fans. Fans are now released when the
+  client that forced them goes, and only that client's heartbeat feeds the
+  watchdog. The 0.2.0 fix — a short-lived `fanctl` no longer stealing control
+  from the app — is preserved.
+- **Non-finite targets are rejected at the XPC boundary.** `min(max(rpm, lo), hi)`
+  is NaN-transparent, because every comparison against NaN is false, so a NaN
+  arriving over XPC survived the clamp, reached the SMC write, and then trapped
+  the `Int(...)` that formatted the error — killing a root process. Error
+  messages no longer use `Int()` on values that reached them for being invalid.
+- **A fan whose limits the SMC never reported is no longer driven.** A missing
+  `F{i}Mn` read as `?? 0`, which is indistinguishable from a fan that genuinely
+  reports a floor of zero — and a zero floor is a clamp that permits stopping the
+  fan outright, on hardware nobody has tested. Such a fan is now shown and
+  monitored but never driven, and the dropdown says so instead of printing a
+  fabricated range beside a slider that would only ever be refused.
+- **Errors from a multi-fan machine are no longer lost.** Each fan's reply
+  overwrote the last, so one fan's success erased another's failure.
+
+### Documented honestly
+
+- SPEC.md claimed the daemon's signing requirement "stops a different or tampered
+  binary" and that "the worst a spoofed client achieves is a fan speed the
+  hardware already permits". Both were wrong. An ad-hoc signature's identifier is
+  chosen by whoever builds the binary, and the linker signs automatically using
+  the *output filename* — `swiftc -o fanctl x.swift` satisfies the requirement
+  with no signing step at all, while the byte-identical `notfanctl` is rejected.
+  Authorization reduced to what the client file was called. And the exposure was
+  never the speed; it was the unbounded duration, because the only thing that
+  would have ended it lived in the untrusted client.
+
+### Also fixed, found reviewing the above
+
+The daemon fix introduced two defects of its own, both caught before release:
+
+- The thermal watch was gated on "a HID client exists" but tripped on "a reading
+  arrived". On a Mac where the first is true and the second never is, the daemon
+  latched a lockout that nothing could lift — because the only thing that lifts
+  it is the reading that never comes — killing fan control for the life of the
+  daemon while blaming heat. A single transient failed read did the same on any
+  Mac. Losing readings now degrades the daemon's failsafe instead of latching,
+  and the watch only starts once a reading has actually been obtained.
+- A *failed* restore cleared all daemon state and stopped the thermal watch, so
+  the one case where the fans might still be forced was the case where
+  supervision was switched off. State now stands and the watchdog is re-armed.
+
 ## 0.3.0
 
 Fan curves, and a safety layer that makes holding a low speed safe under load.

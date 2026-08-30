@@ -73,9 +73,15 @@ struct DropdownView: View {
                 HStack(alignment: .firstTextBaseline) {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("Fan \(fan.index + 1)").font(.subheadline.weight(.medium))
-                        Text("\(Int(fan.minRPM))–\(Int(fan.maxRPM)) rpm")
+                        // A fan whose limits the SMC never published cannot be
+                        // driven safely, so say that rather than printing a
+                        // range with a fabricated 0 floor beside a slider that
+                        // will only ever be refused.
+                        Text(fan.limitsReported
+                             ? "\(Int(fan.minRPM))–\(Int(fan.maxRPM)) rpm"
+                             : "speed limits not reported — monitoring only")
                             .font(.caption)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(fan.limitsReported ? Color.secondary : Color.orange)
                     }
                     Spacer()
                     Text("\(Int(fan.actualRPM)) rpm")
@@ -236,7 +242,7 @@ struct DropdownView: View {
             // the "use one slider for all fans" setting had nothing to switch
             // between and appeared to do nothing.
             VStack(alignment: .leading, spacing: 6) {
-                ForEach(monitor.fans) { fan in
+                ForEach(monitor.fans.filter(\.limitsReported)) { fan in
                     fanSlider(for: fan, label: "Fan \(fan.index + 1)")
                 }
             }

@@ -5,7 +5,7 @@ public enum SMCKit {
     /// Project version. `scripts/release.sh` checks this against
     /// `CFBundleShortVersionString` in Info.plist, so the CLI and the daemon can
     /// never report a different version from the app they shipped with.
-    public static let version = "0.3.0"
+    public static let version = "0.4.0"
 }
 
 /// A single reading of everything the UI needs, taken together so the
