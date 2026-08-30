@@ -34,6 +34,10 @@ final class FanService {
     private var watchdog: DispatchSourceTimer?
     private var hasForcedFans = false
 
+    /// Set once the process is on its way out, after which no request may force
+    /// a fan again. See `shutdownAndRestore`.
+    private var isShuttingDown = false
+
     private init() {}
 
     func start() {
@@ -65,6 +69,7 @@ final class FanService {
 
     func setFan(index: Int, targetRPM: Double) -> String? {
         queue.sync {
+            guard !isShuttingDown else { return "helper is shutting down" }
             guard let controller else { return "helper has no SMC connection" }
             do {
                 let result = try controller.setTarget(fanIndex: index, rpm: targetRPM)
@@ -113,6 +118,25 @@ final class FanService {
     /// writes fail for their entire retry window and leaves the fans forced.
     func emergencyRestore(reason: String) {
         queue.sync { performRestore(reason: reason) }
+    }
+
+    /// Restore, then refuse to force anything again. For paths that end in
+    /// `exit()`.
+    ///
+    /// Restoring takes a few seconds, and the app keeps sending its target every
+    /// two seconds throughout — including while the daemon is being replaced,
+    /// which is when a stop is most likely. Those requests queue behind the
+    /// restore and would otherwise be honoured *after* it, re-forcing the fans
+    /// and setting `Ftst` again moments before the process exits. Nothing would
+    /// then be left to hand them back.
+    ///
+    /// Both the flag and the restore run in one block on the serial queue, so a
+    /// request already executing finishes first and every later one is refused.
+    func shutdownAndRestore(reason: String) {
+        queue.sync {
+            isShuttingDown = true
+            performRestore(reason: reason)
+        }
     }
 
     /// Must be called on `queue`.
@@ -299,7 +323,9 @@ func installSignalHandlers() {
         signal(signalNumber, SIG_IGN)
         let source = DispatchSource.makeSignalSource(signal: signalNumber, queue: .main)
         source.setEventHandler {
-            FanService.shared.emergencyRestore(reason: "received signal \(signalNumber)")
+            // Shutdown variant: the process is about to exit, so nothing may be
+            // allowed to re-force the fans after this restore.
+            FanService.shared.shutdownAndRestore(reason: "received signal \(signalNumber)")
             exit(0)
         }
         source.resume()

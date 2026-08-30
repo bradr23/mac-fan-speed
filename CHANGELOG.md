@@ -26,6 +26,19 @@ Bug fixes found while reviewing 0.1.0 for wider release.
 - **Fan control stayed dead after a transient daemon failure.** Nothing re-tested
   a helper that had stopped answering, so control remained unavailable until
   someone opened Settings and pressed Re-check. The app now retries on its own.
+- **Reinstalling the helper while fan control was active failed** with
+  `Bootstrap failed: 5: Input/output error`, leaving the new files installed and
+  nothing running. `launchctl bootout` returns as soon as the signal is sent, but
+  the daemon spends a few seconds handing the fans back to macOS on the way out,
+  so the reinstall raced its own shutdown — the busier the daemon, the more
+  certain the failure. The installer now waits for the old job to actually go,
+  and retries.
+- **A request arriving mid-shutdown could re-force the fans.** The app re-sends
+  its target every two seconds, including while the daemon is stopping. Those
+  requests queued behind the restore and were then honoured *after* it, setting
+  `Ftst` again moments before the process exited, with nothing left running to
+  hand the fans back. The daemon now refuses to force a fan once shutdown has
+  begun.
 
 ### Added
 

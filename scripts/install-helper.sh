@@ -48,6 +48,24 @@ fi
 echo "==> stopping any previous daemon"
 launchctl bootout "system/$LABEL" 2>/dev/null || true
 
+# `bootout` returns as soon as the signal is sent, not once the job has gone.
+# This daemon hands the fans back to macOS on SIGTERM — around 3 s normally, and
+# up to about 14 s if the firmware is slow to reclaim them. Bootstrapping while
+# the old job is still registered fails with
+#
+#     Bootstrap failed: 5: Input/output error
+#
+# which is what updating the helper *while a preset was active* did every time:
+# the busier the daemon, the longer it takes to exit, the more certain the race.
+# launchd escalates to SIGKILL after its own timeout, so this always terminates.
+printf "    waiting for it to exit"
+for _ in $(seq 1 150); do
+    launchctl print "system/$LABEL" >/dev/null 2>&1 || break
+    printf "."
+    sleep 0.2
+done
+echo
+
 echo "==> installing $BIN_DST"
 mkdir -p /usr/local/libexec
 install -m 755 -o root -g wheel "$BIN_SRC" "$BIN_DST"
@@ -56,7 +74,31 @@ echo "==> installing $PLIST_DST"
 install -m 644 -o root -g wheel "$PLIST_SRC" "$PLIST_DST"
 
 echo "==> loading daemon"
-launchctl bootstrap system "$PLIST_DST"
+# Retried rather than attempted once: the wait above covers the common race, but
+# launchd can still be finishing with the old job. A failure here leaves the new
+# binary installed and nothing running, which is the one outcome that needs a
+# second command from the user — so it is worth a few more seconds to avoid.
+bootstrap_error=""
+bootstrapped=false
+for attempt in 1 2 3; do
+    if bootstrap_error="$(launchctl bootstrap system "$PLIST_DST" 2>&1)"; then
+        bootstrapped=true
+        break
+    fi
+    [ "$attempt" -lt 3 ] && sleep 2
+done
+
+if [ "$bootstrapped" != true ]; then
+    echo "" >&2
+    echo "Could not start the daemon: ${bootstrap_error:-unknown error}" >&2
+    echo "" >&2
+    echo "The new files are installed; only starting them failed. Try:" >&2
+    echo "  sudo launchctl bootout system/$LABEL" >&2
+    echo "  sudo launchctl bootstrap system $PLIST_DST" >&2
+    echo "Rebooting also loads it, since the daemon starts at boot." >&2
+    exit 1
+fi
+
 launchctl enable "system/$LABEL"
 
 sleep 1
