@@ -42,6 +42,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
            let fraction = Double(percent) {
             runManualControlTest(percent: fraction / 100)
         }
+        if ProcessInfo.processInfo.environment["MFS_TEST_GUARD"] != nil {
+            runGuardTest()
+        }
         // Opening Settings normally means clicking the menu bar item, which
         // needs Accessibility permission to automate.
         if ProcessInfo.processInfo.environment["MFS_SENSORS"] == "1" {
@@ -159,6 +162,81 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
               }
             }
         }
+    }
+
+    /// Walk a temperature ramp through the real controller and print what it
+    /// would command, without heating anything.
+    ///
+    /// The escalation path is the one part of this app that matters most and is
+    /// hardest to exercise honestly: reproducing it for real means driving a Mac
+    /// to 90 °C with its fans pinned low, which is exactly the situation the code
+    /// exists to prevent. This runs the shipping `CurveController` — the same
+    /// filter, deadband and rate limiter — against a synthetic ramp instead.
+    private func runGuardTest() {
+        // Deferred like the other hooks so the first poll has produced fan
+        // readings; without them the rpm column is the interesting part missing.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4) { self.reportGuardRamp() }
+    }
+
+    private func reportGuardRamp() {
+        var out = "guardtest.fans: \(FanMonitor.shared.fans.count)\n"
+        let fan = FanMonitor.shared.fans.first
+        let requested = 0.15
+        out += "guardtest.requested: \(Int(requested * 100))%"
+            + (fan.map { " (\(Int($0.rpm(forPercent: requested))) rpm)" } ?? "") + "\n"
+        out += "guardtest.cutoff: \(Int(FanMonitor.shared.settings.safetyCutoffCelsius)) °C\n"
+        out += "  °C   requested  commanded  rpm      driver\n"
+
+        var controller = CurveController()
+        controller.reset(to: requested)
+        var clock = Date(timeIntervalSince1970: 1_000_000)
+        var tick = 0
+
+        for celsius in stride(from: 40.0, through: 94.0, by: 2.0) {
+            // Hold each step long enough for the filter and rate limiter to
+            // settle, so the printed value is the steady state rather than a
+            // point on a ramp.
+            var commanded = 0.0
+            for _ in 0..<25 {
+                clock = clock.addingTimeInterval(FanMonitor.pollInterval)
+                tick += 1
+                commanded = controller.step(
+                    requested: requested, curve: nil, rawCelsius: celsius, now: clock
+                )
+            }
+            let rpm = fan.map { String(Int($0.rpm(forPercent: commanded))) } ?? "—"
+            let driver: String
+            switch controller.driver {
+            case .user: driver = "user"
+            case .profileCurve: driver = "curve"
+            case .thermalGuard: driver = "GUARD"
+            }
+            let pad = { (text: String, width: Int) -> String in
+                text.padding(toLength: max(width, text.count), withPad: " ", startingAt: 0)
+            }
+            out += pad(String(Int(celsius)), 5) + pad("\(Int(requested * 100))%", 11)
+                + pad("\(Int(commanded * 100))%", 11) + pad(rpm, 9) + driver + "\n"
+        }
+
+        // The property that matters: the floor may only ever raise a speed.
+        var everLowered = false
+        var controller2 = CurveController()
+        controller2.reset(to: requested)
+        var clock2 = Date(timeIntervalSince1970: 2_000_000)
+        for celsius in stride(from: 30.0, through: 94.0, by: 1.0) {
+            for _ in 0..<15 {
+                clock2 = clock2.addingTimeInterval(FanMonitor.pollInterval)
+                let value = controller2.step(
+                    requested: requested, curve: nil, rawCelsius: celsius, now: clock2
+                )
+                if value < requested - 0.001 { everLowered = true }
+            }
+        }
+        out += "guardtest.neverLoweredBelowRequest: \(!everLowered)\n"
+        out += "guardtest.result: \(everLowered ? "FAIL" : "PASS")\n"
+
+        FileHandle.standardError.write(Data(out.utf8))
+        NSApp.terminate(nil)
     }
 
     /// Round-trip the login item: enable, verify, disable, verify.

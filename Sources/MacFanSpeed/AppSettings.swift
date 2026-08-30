@@ -51,6 +51,27 @@ final class AppSettings: ObservableObject {
         didSet { defaults.set(historyMinutes, forKey: Keys.historyMinutes) }
     }
 
+    /// CPU temperature at which the fans go back to macOS.
+    ///
+    /// Settable **downward only**. The clamp here is one of four layers — the
+    /// UI slider's range, this write, the read in `init`, and `Failsafe` itself,
+    /// which clamps unconditionally and is the one the safety argument actually
+    /// rests on. This layer is what catches a hand-edited preferences file or a
+    /// `defaults write` from a script.
+    @Published var safetyCutoffCelsius: Double {
+        didSet {
+            let clamped = Failsafe.clampTrip(safetyCutoffCelsius)
+            // Assigning re-enters this observer, which then takes the else
+            // branch and persists. Returning here avoids writing the unclamped
+            // value first.
+            if clamped != safetyCutoffCelsius {
+                safetyCutoffCelsius = clamped
+                return
+            }
+            defaults.set(clamped, forKey: Keys.safetyCutoff)
+        }
+    }
+
     private enum Keys {
         static let unit = "temperatureUnit"
         static let startupMode = "startupMode"
@@ -59,21 +80,35 @@ final class AppSettings: ObservableObject {
         static let linkFans = "linkFans"
         static let perFanPercent = "perFanPercent"
         static let historyMinutes = "historyMinutes"
+        static let safetyCutoff = "safetyCutoffCelsius"
     }
 
-    private let defaults = UserDefaults.standard
+    private let defaults: UserDefaults
 
-    init() {
+    /// Injectable so tests can run against a scratch domain instead of the
+    /// developer's live settings.
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
         unit = defaults.string(forKey: Keys.unit)
             .flatMap(TemperatureUnit.init(rawValue:)) ?? .celsius
         startupMode = defaults.string(forKey: Keys.startupMode)
             .flatMap(StartupMode.init(rawValue:)) ?? .auto
-        manualPercent = defaults.object(forKey: Keys.manualPercent) as? Double ?? 0.35
+        // Sanitised on read for the same reason as safetyCutoffCelsius below: a
+        // hand-edited plist can hold NaN, and `max(.nan, floor)` is nan, so an
+        // unchecked value here would silently defeat the thermal safety floor.
+        let storedManual = defaults.object(forKey: Keys.manualPercent) as? Double ?? 0.35
+        manualPercent = storedManual.isFinite ? min(max(storedManual, 0), 1) : 0.35
         selectedPresetID = (defaults.string(forKey: Keys.selectedPreset)).flatMap(UUID.init)
         linkFans = defaults.object(forKey: Keys.linkFans) as? Bool ?? true
-        perFanPercent = defaults.dictionary(forKey: Keys.perFanPercent) as? [String: Double] ?? [:]
+        perFanPercent = (defaults.dictionary(forKey: Keys.perFanPercent) as? [String: Double] ?? [:])
+            .compactMapValues { $0.isFinite ? min(max($0, 0), 1) : nil }
         historyMinutes = defaults.object(forKey: Keys.historyMinutes) as? Int
             ?? HistoryRange.defaultMinutes
+        // Clamped on the way in as well as out: a value written by a different
+        // build, or by hand, must not be able to raise the cutoff.
+        safetyCutoffCelsius = Failsafe.clampTrip(
+            defaults.object(forKey: Keys.safetyCutoff) as? Double ?? Failsafe.defaultTripCelsius
+        )
     }
 
     // MARK: Launch at login

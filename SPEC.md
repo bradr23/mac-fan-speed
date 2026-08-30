@@ -45,10 +45,24 @@ Built-ins: **Quiet** 0 % (fan minimum), **Cool** 35 %, **Max** 100 %. The UI sho
 - **Manual**: user sets a target RPM per fan, clamped to `[fanMin, fanMax]` as reported by the SMC.
 - **Preset**: a named percentage set; internally identical to Manual once resolved.
 
-### Temperature failsafe (mandatory, not user-configurable)
+### Temperature failsafe (mandatory, lowerable but never raisable)
 - Hottest CPU sensor ≥ **95 °C** → immediately revert to Auto and show a warning state in the menu bar (`⚠︎ 96°`).
 - Stay in Auto until temp < **85 °C** (hysteresis), then restore the user's previous mode.
-- Constants in code: `failsafeTripCelsius = 95`, `failsafeResetCelsius = 85`.
+- Constants in code: `Failsafe.assumedCriticalCelsius = 100`, `maximumTripCelsius = 95`
+  (the ceiling *and* the default), `minimumTripCelsius = 60`, reset derived as
+  trip − 10.
+- **The critical temperature is an assumption, not a reading.** All 3222 SMC keys
+  on a Mac16,8 were enumerated and none is a thermal limit. The most convincing
+  candidate, `mlTJ`/`mlTj` reading 100.00 — `Tj` being the standard notation for
+  junction temperature — is element ten of a twelve-entry percentage table
+  (`mlT0…mlT3`, `mlTI…mlTL`, `mlTi…mlTl`, all 100.00). In a four-character key
+  namespace there will always be letters that spell something thermal, so the
+  constant is named `assumedCriticalCelsius` and never inferred from the SMC.
+- Supplementary trips, none configurable: readings lost, readings stale (>6 s),
+  battery >55 °C, storage >80 °C, CPU above 85 °C for 5 minutes, and
+  `ProcessInfo.thermalState` at `.serious`/`.critical`. The last is
+  supplementary only — `NSProcessInfo` documents that an unknown or unsupported
+  thermal state reads `.nominal`, so it can never be evidence of safety.
 - Also trips if temperature reads become unavailable while in Manual — no sensor means no safe manual control.
 
 ### Settings window
@@ -289,7 +303,7 @@ selftest.detail: temp=38.8°C (PMU tdie6) fans=[0, 0] samples=3 label='39° 0'
 
 1. Never write SMC keys other than `F{i}Md`, `F{i}Tg` and `Ftst`; always clamp to SMC-reported min/max. `Ftst` is the firmware unlock (see "Taking manual control") and is the third and last member of that closed set.
 2. Every exit path — quit, crash via watchdog, sleep, helper termination — ends with fans in Auto **and `Ftst` back to 0**. Leaving `Ftst` set keeps thermal management handed to a process that may no longer exist; it is the worst state this code can produce, so the clearing write is verified and retried rather than issued once.
-3. The 95 °C failsafe is mandatory and never user-configurable.
+3. The temperature failsafe is mandatory and never user-*raisable*; the ceiling equals the shipped default.
 4. Losing temperature readings while in Manual forces Auto.
 5. Never assume fan count, RPM range, or sensor names. Read them, or degrade visibly.
 6. After any test session that forced fan mode, run `sudo fanctl auto` and verify every fan
@@ -298,4 +312,6 @@ selftest.detail: temp=38.8°C (PMU tdie6) fans=[0, 0] samples=3 label='39° 0'
 
 ## Out of scope
 
-Intel Macs, temp→RPM curve editor, notifications, per-app rules, localization, auto-update, App Store distribution.
+Intel Macs, notifications, per-app rules, localization, auto-update, App Store distribution.
+
+Per-fan curves are a deliberate non-goal: a curve is one machine-wide intent, the same way a preset already is. Unlinked per-fan speeds remain available on fixed-speed profiles.

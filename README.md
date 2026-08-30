@@ -13,12 +13,15 @@ macOS keeps the fans off until the machine is already hot. That's fine for the h
 
 <img src="docs/menubar.png" alt="Temperature and fan speed in the menu bar" width="330">
 
-<img src="docs/dropdown.png" alt="The dropdown, showing temperature, per-fan speeds, history charts and mode buttons" width="300"> <img src="docs/sensors.png" alt="The Sensors window, listing every hardware temperature grouped by what it measures" width="300">
+<img src="docs/dropdown.png" alt="The dropdown, showing temperature, per-fan speeds, history charts and mode buttons" width="290"> <img src="docs/sensors.png" alt="The Sensors window, listing every hardware temperature grouped by what it measures" width="290">
+
+<img src="docs/presets.png" alt="The Presets tab, editing a fan curve with a chart and a table of control points" width="380"> <img src="docs/settings-safety.png" alt="The Safety settings, with the cutoff slider at its maximum" width="380">
 
 ## Features
 
 - CPU temperature and fan RPM in the menu bar
-- Manual fan control, with presets — **Quiet**, **Cool**, **Max** — plus your own
+- Manual fan control, with presets — **Quiet**, **Cool**, **Smart**, **Max** — plus your own
+- **Fan curves**: set a speed for each temperature — 15% at 40 °C, 55% at 70 °C — per profile
 - Temperature and fan history charts, over 5 minutes to 6 hours
 - **Every hardware sensor your Mac exposes**, in a Sensors window — grouped by what it measures, with readable names and the hardware's own name kept alongside
 - Starts at login and restores whatever you last had set
@@ -63,6 +66,14 @@ Each release publishes a `.sha256` alongside the archive if you want to check th
 shasum -a 256 MacFanSpeed-0.1.0.zip
 ```
 
+### Setting a fan curve
+
+**Settings → Presets**, pick a profile, and turn on **Vary speed with temperature**. Each control point is a temperature and a speed; between points the speed is interpolated, and the chart shows the shape with a marker for where your Mac is right now.
+
+The shipped **Smart** profile is a curve: 15% at 40 °C rising to 90% at 85 °C. The other presets hold one speed at any temperature, which is still the right thing for "keep it quiet on my lap".
+
+Speeds are percentages of each fan's own range, so a curve made on one Mac means the same thing on another.
+
 ### Enabling fan control
 
 Reading temperatures needs no privileges. *Changing* fan speed does, so a small background service runs as an administrator and does nothing else.
@@ -87,10 +98,16 @@ Keep only one copy of the app. Two copies in different folders both start, both 
 
 Holding fans **slower** than macOS would choose can let the machine run hotter than Apple intends. These protections are not optional and cannot be turned off:
 
-- If the CPU reaches **95 °C**, the fans return to macOS control immediately and stay there until the machine drops below 85 °C.
+- **Your setting is a floor, not a ceiling.** Below about 65 °C the app holds exactly the speed you asked for. Above it, the fans are raised towards full regardless of your setting, so a machine you told to stay quiet cannot be held quiet while it cooks. Set 15% and tax the machine and you get 60% at 80 °C, 100% by 90 °C — your slider does not move, and the dropdown says why the fans did.
+- If the CPU reaches the **safety cutoff**, the fans return to macOS control entirely and stay there until the machine drops 10 °C below it. The cutoff defaults to 95 °C and can be **lowered** in Settings, never raised — see below.
+- The fans also go back to macOS if readings are lost or stop updating, if the battery or storage overheats, if the CPU stays above 85 °C for five minutes, or if macOS itself reports thermal pressure. None of those are configurable.
 - If temperature readings become unavailable while fans are under manual control, the app hands them back rather than holding a speed blind.
 - If the app crashes or is force-quit, the background service returns the fans to macOS within a few seconds — measured at 3 seconds on the development machine.
 - Quitting, sleeping, or removing the helper all restore automatic control. Sleep waits for the fans to be handed back before the machine goes down.
+
+### Why the cutoff cannot be raised
+
+Apple has never published a critical temperature for any M-series chip, and nothing on the machine reports one — all 3222 SMC keys on the development Mac were checked. So the app assumes **100 °C** and stops 5 °C short of it. That 95 °C ceiling is also the default, which means no setting you can reach makes your Mac hotter than a stock install already allows. Lower is safer; 90 °C is a sensible choice on a laptop.
 
 Apple Silicon Macs also throttle themselves in hardware regardless of fan speed. That said, this software comes with no warranty; see [LICENSE](LICENSE).
 

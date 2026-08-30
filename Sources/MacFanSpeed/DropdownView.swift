@@ -227,7 +227,9 @@ struct DropdownView: View {
 
     @ViewBuilder
     private var speedSlider: some View {
-        if monitor.linkFans || monitor.fans.count < 2 {
+        if monitor.activeCurve != nil {
+            curveReadout
+        } else if monitor.linkFans || monitor.fans.count < 2 {
             singleSlider
         } else {
             // Unlinked: one row per fan, each with its own speed. Without this
@@ -239,6 +241,53 @@ struct DropdownView: View {
                 }
             }
         }
+    }
+
+    /// A curve chooses the speed from temperature, so there is nothing to drag.
+    /// Show what it has settled on instead of a slider that would lie.
+    private var curveReadout: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack {
+                Text("Speed").font(.caption)
+                Spacer()
+                Text(commandedLabel)
+                    .font(.caption)
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
+            }
+            ProgressView(value: monitor.commandedPercent)
+                .progressViewStyle(.linear)
+            driverCaption
+        }
+    }
+
+    /// Names whatever is actually deciding the speed.
+    ///
+    /// Without this, a user who set 15% and hears the fans at 6000 rpm has no
+    /// way to know the safety floor raised it, and reports a bug.
+    @ViewBuilder
+    private var driverCaption: some View {
+        switch monitor.speedDriver {
+        case .user:
+            EmptyView()
+        case .profileCurve:
+            Text("Following the curve for this profile.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        case .thermalGuard(let requested, let celsius):
+            Text(celsius.isFinite
+                 ? "Raised from \(Int(requested * 100))% — CPU at \(Int(celsius)) °C."
+                 : "Raised while the temperature is unreadable.")
+                .font(.caption2)
+                .foregroundStyle(.orange)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private var commandedLabel: String {
+        let percent = Int(monitor.commandedPercent * 100)
+        guard let fan = monitor.fans.first, fan.maxRPM > fan.minRPM else { return "\(percent)%" }
+        return "\(percent)%  ·  \(Int(fan.rpm(forPercent: monitor.commandedPercent))) rpm"
     }
 
     private var singleSlider: some View {
@@ -261,6 +310,11 @@ struct DropdownView: View {
                 in: 0...1
             )
             .disabled(monitor.mode != .manual)
+
+            // The slider keeps showing what the user asked for even while the
+            // guard is overriding it, so their setting is never silently
+            // rewritten — but the override has to be visible.
+            driverCaption
         }
     }
 
@@ -269,7 +323,7 @@ struct DropdownView: View {
             HStack {
                 Text(label).font(.caption)
                 Spacer()
-                Text("\(Int(monitor.percent(for: fan) * 100))%  ·  "
+                Text("\(Int(monitor.requestedPercent(for: fan) * 100))%  ·  "
                      + "\(Int(monitor.target(for: fan))) rpm")
                     .font(.caption)
                     .monospacedDigit()
@@ -277,7 +331,7 @@ struct DropdownView: View {
             }
             Slider(
                 value: Binding(
-                    get: { monitor.percent(for: fan) },
+                    get: { monitor.requestedPercent(for: fan) },
                     set: { monitor.setPercent($0, fanIndex: fan.index) }
                 ),
                 in: 0...1

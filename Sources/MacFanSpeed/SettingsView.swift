@@ -59,7 +59,7 @@ struct SettingsView: View {
                 .tabItem { Label(Tab.about.rawValue, systemImage: Tab.about.icon) }
                 .tag(Tab.about)
         }
-        .frame(width: 460, height: 400)
+        .frame(width: 540, height: 620)
     }
 }
 
@@ -128,6 +128,58 @@ private struct GeneralSettings: View {
             }
 
             Section {
+                Slider(
+                    value: $settings.safetyCutoffCelsius,
+                    in: Failsafe.settableRange,
+                    step: 1
+                ) {
+                    Text("Return fans to macOS at")
+                } minimumValueLabel: {
+                    Text("\(Int(Failsafe.minimumTripCelsius))°").font(.caption2)
+                } maximumValueLabel: {
+                    Text("\(Int(Failsafe.maximumTripCelsius))°").font(.caption2)
+                }
+
+                LabeledContent("Cutoff") {
+                    Text("\(Int(settings.safetyCutoffCelsius)) °C")
+                        .monospacedDigit()
+                        .foregroundStyle(.primary)
+                }
+
+                Text("Fan control stops and macOS takes over at "
+                     + "\(Int(settings.safetyCutoffCelsius)) °C, and stays in charge until "
+                     + "\(Int(Failsafe(tripCelsius: settings.safetyCutoffCelsius).resetCelsius)) °C.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                if settings.safetyCutoffCelsius >= Failsafe.maximumTripCelsius {
+                    InlineNote(
+                        icon: "exclamationmark.triangle",
+                        tint: .orange,
+                        text: "This is the highest setting available and cannot be raised. "
+                            + "Apple does not publish a critical temperature for Apple "
+                            + "Silicon, so this app assumes \(Int(Failsafe.assumedCriticalCelsius)) °C "
+                            + "and stops 5 °C short. Lower is safer — 90 °C is a good "
+                            + "choice on a laptop."
+                    )
+                }
+
+                Text("These always apply and are not configurable: fans return to macOS "
+                     + "if temperature readings are lost or stop updating, if the battery "
+                     + "or storage overheats, if the CPU stays above "
+                     + "\(Int(Failsafe.sustainedCelsius)) °C for "
+                     + "\(Int(Failsafe.sustainedDuration / 60)) minutes, or if macOS itself "
+                     + "reports thermal pressure. Below the cutoff, Mac Fan Speed also "
+                     + "raises the fans above your setting as the machine heats up.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } header: {
+                Text("Safety").font(.headline)
+            }
+
+            Section {
                 Toggle("Use one slider for all fans", isOn: $settings.linkFans)
                     .disabled(monitor.fans.count < 2)
                 if monitor.fans.count < 2 {
@@ -186,6 +238,32 @@ private struct PresetSettings: View {
                         .tag(preset.id)
                 }
             }
+            // Fixed rather than flexible: left to itself the list expands and
+            // squeezes the editor below it off the bottom of a window that
+            // cannot be resized taller.
+            .frame(height: 212)
+            // Select something straight away: an empty detail pane below the
+            // list reads as a broken layout rather than as "nothing selected".
+            .onAppear {
+                guard selection == nil else { return }
+                // MFS_SELECT_PRESET exists for the documentation screenshots,
+                // the same reason MFS_PREVIEW and MFS_SETTINGS do: the window
+                // cannot be clicked without Accessibility permission.
+                let wanted = ProcessInfo.processInfo.environment["MFS_SELECT_PRESET"]
+                selection = presets.presets.first { $0.name == wanted }?.id
+                    ?? presets.presets.first?.id
+            }
+
+            Divider()
+
+            ScrollView {
+                if let selected = presets.preset(id: selection) {
+                    curveSection(for: selected)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 10)
+                }
+            }
+            .frame(maxHeight: .infinity)
 
             Divider()
             HStack {
@@ -209,6 +287,45 @@ private struct PresetSettings: View {
                 Button("Restore Defaults") { presets.resetToDefaults() }
             }
             .padding(10)
+        }
+    }
+
+    /// The curve toggle and, when it is on, the editor for the selected profile.
+    @ViewBuilder
+    private func curveSection(for preset: FanPreset) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Toggle("Vary speed with temperature", isOn: Binding(
+                get: { preset.curve != nil },
+                set: { usesCurve in
+                    var copy = preset
+                    copy.setUsesCurve(usesCurve)
+                    presets.update(copy)
+                }
+            ))
+            .font(.callout)
+
+            if let curve = preset.curve {
+                CurveEditorView(
+                    curve: Binding(
+                        get: { curve },
+                        set: { updated in
+                            var copy = preset
+                            copy.curve = updated
+                            presets.update(copy)
+                        }
+                    ),
+                    fans: monitor.fans,
+                    currentCelsius: monitor.cpu?.celsius,
+                    cutoffCelsius: monitor.settings.safetyCutoffCelsius
+                )
+            } else {
+                Text("“\(preset.name)” holds one speed at any temperature. "
+                     + "Turn this on to set different speeds for different "
+                     + "temperatures.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
     }
 }
@@ -247,7 +364,7 @@ private struct PresetRow: View {
             }
             .frame(width: 96, alignment: .trailing)
         }
-        .padding(.vertical, 2)
+        .padding(.vertical, 1)
     }
 }
 
@@ -405,8 +522,9 @@ private struct AboutSettings: View {
 
             VStack(spacing: 3) {
                 Text("Fans return to macOS control automatically if the CPU reaches "
-                     + "95 °C, if temperature readings are lost, or if this app quits "
-                     + "or crashes.")
+                     + "\(Int(settings.safetyCutoffCelsius)) °C, if temperature readings "
+                     + "are lost or stop updating, if the battery or storage overheats, "
+                     + "or if this app quits or crashes.")
                 Text("MIT licensed. No warranty.")
             }
             .font(.caption)

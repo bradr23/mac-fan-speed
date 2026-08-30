@@ -72,9 +72,24 @@ final class FanMonitor: ObservableObject {
     let installer = HelperInstaller()
 
     private var failsafe = Failsafe()
+    private var curveController = CurveController()
     private var monitor: SystemMonitor?
     private var timer: Timer?
     private var hasRestoredStartupMode = false
+    /// When a snapshot last arrived. Feeds the stale-readings trip: a control
+    /// loop that stops while the UI keeps showing its last comfortable value is
+    /// a documented failure mode in this class of app.
+    private var lastSnapshotAt: Date?
+
+    /// The curve last handed to the controller, so an edit can be detected and
+    /// applied immediately rather than waiting for the temperature to drift.
+    private var lastAppliedCurve: FanCurve?
+
+    /// What is currently deciding the fan speed, for the dropdown caption.
+    @Published private(set) var speedDriver: SpeedDriver = .user
+    /// The speed actually being commanded, after the curve, the safety floor and
+    /// the rate limiter. Distinct from what the user asked for.
+    @Published private(set) var commandedPercent: Double = 0
 
     /// SMC and sensor reads happen off the main thread so a slow read can never
     /// stutter the menu bar. The queue is serial, so the SMC connection is only
@@ -135,9 +150,41 @@ final class FanMonitor: ObservableObject {
 
     private func poll() {
         guard let monitor else { return }
+
+        // Checked here, on the main timer, and NOT inside apply(): if the poll
+        // queue wedges, apply() never runs, so a staleness check living there
+        // could never fire — which is exactly what it did. The whole point of
+        // this rule is a control loop that has stopped while the UI keeps
+        // showing its last comfortable reading.
+        checkForStaleReadings()
+
         pollQueue.async { [weak self] in
             let snapshot = monitor.snapshot()
             Task { @MainActor in self?.apply(snapshot) }
+        }
+    }
+
+    /// Hand the fans back if snapshots have stopped arriving.
+    private func checkForStaleReadings() {
+        guard mode == .manual, let last = lastSnapshotAt else { return }
+        let age = Date().timeIntervalSince(last)
+        guard age > Failsafe.staleReadingSeconds else { return }
+
+        mode = .auto
+        failsafeMessage = Failsafe.Reason.readingsStale(age).message
+        releaseToAutomatic(reason: "stale readings")
+    }
+
+    /// Ask the daemon for automatic control and report if it refuses.
+    ///
+    /// The failsafe used to call `helper.setAllAuto()` with no completion, so a
+    /// daemon that answered "I could not" was ignored while the UI stated the
+    /// fans had been returned. The one moment the app most needs to be honest
+    /// about failing is this one.
+    private func releaseToAutomatic(reason: String) {
+        helper.setAllAuto { [weak self] error in
+            guard let self, let error else { return }
+            self.lastControlError = "Could not return the fans to macOS (\(reason)): \(error)"
         }
     }
 
@@ -145,6 +192,7 @@ final class FanMonitor: ObservableObject {
         fans = snapshot.fans
         cpu = snapshot.cpuTemperature
         allSensors = snapshot.sensors
+        lastSnapshotAt = Date()
 
         // A daemon that stopped answering blocks every control path, so keep
         // testing it rather than waiting for someone to press "Re-check".
@@ -152,11 +200,18 @@ final class FanMonitor: ObservableObject {
 
         restoreStartupModeIfNeeded()
         // Last, so nothing in this tick can re-enable manual behind its back.
-        evaluateFailsafe(celsius: snapshot.cpuTemperature?.celsius)
+        evaluateFailsafe(snapshot: snapshot)
 
         // Re-send targets every poll. This doubles as the heartbeat that keeps
         // the daemon's watchdog from handing the fans back.
-        if mode == .manual { sendTargets() }
+        //
+        // The curve is recomputed inside this gate rather than before it, so it
+        // inherits the failsafe's answer by construction instead of needing its
+        // own check that could drift out of step.
+        if mode == .manual {
+            recomputeCommandedSpeed(rawCelsius: snapshot.cpuTemperature?.celsius)
+            sendTargets()
+        }
 
         samples.append(
             Sample(
@@ -209,11 +264,72 @@ final class FanMonitor: ObservableObject {
         Date().addingTimeInterval(-Double(historyRange.rawValue) * 60)
     }
 
-    /// Speed for one fan, as a fraction of its range. With fans linked they all
+    /// What the user asked for, as a fraction of the fan's range — the slider
+    /// position, not what is actually being commanded. With fans linked they all
     /// share one value; unlinked, each keeps its own.
-    func percent(for fan: Fan) -> Double {
+    ///
+    /// A curve profile has no per-fan notion: it is one machine-wide intent, the
+    /// same way a preset already is.
+    func requestedPercent(for fan: Fan) -> Double {
+        if let preset = presets.preset(id: activePresetID), preset.curve != nil {
+            return commandedPercent
+        }
         guard !settings.linkFans else { return settings.manualPercent }
         return settings.perFanPercent["\(fan.index)"] ?? settings.manualPercent
+    }
+
+    /// What will actually be sent: the user's request raised to the safety floor
+    /// if the machine is hot, then rate-limited.
+    ///
+    /// The two are deliberately separate. The slider keeps showing the user's
+    /// intent even while the guard is overriding it, so their setting is never
+    /// silently rewritten.
+    func commandedPercent(for fan: Fan) -> Double {
+        guard !settings.linkFans, activeCurve == nil,
+              let stored = settings.perFanPercent["\(fan.index)"]
+        else { return commandedPercent }
+        // Unlinked fixed profiles keep independent speeds, each floored
+        // separately against the same guard.
+        return max(stored, ThermalGuard.percent(atCelsius: curveController.filteredCelsius))
+    }
+
+    /// Curve of the active profile, if it has one.
+    var activeCurve: FanCurve? { presets.preset(id: activePresetID)?.curve }
+
+    /// Start (or restart) the control loop from a clean slate.
+    ///
+    /// Called wherever continuity breaks — entering manual, switching profile,
+    /// moving the slider, the failsafe releasing — so a reference temperature
+    /// from before the gap cannot govern the first commit after it, and so a
+    /// deliberate user action takes effect at once instead of being rate-limited
+    /// into looking broken.
+    private func beginControl() {
+        lastAppliedCurve = nil
+        curveController.reset(to: activeCurve == nil ? settings.manualPercent : 0)
+        recomputeCommandedSpeed(rawCelsius: cpu?.celsius, immediate: true)
+    }
+
+    /// Recompute what to command, from the profile (or flat speed) and the
+    /// safety floor.
+    private func recomputeCommandedSpeed(rawCelsius: Double?, immediate: Bool = false) {
+        let curve = activeCurve
+        let requested = curve == nil ? settings.manualPercent : 0
+
+        // Editing a curve has to take effect now. The deadband only commits a
+        // new value once the *temperature* has moved past it, so an edit made
+        // while the machine sat at a steady temperature did nothing at all —
+        // sometimes for minutes — and looked like the editor was broken.
+        let curveChanged = curve != lastAppliedCurve
+        lastAppliedCurve = curve
+
+        commandedPercent = curveController.step(
+            requested: requested,
+            curve: curve,
+            rawCelsius: rawCelsius,
+            now: Date(),
+            immediate: immediate || curveChanged
+        )
+        speedDriver = curveController.driver
     }
 
     func setMode(_ newMode: ControlMode) {
@@ -234,6 +350,7 @@ final class FanMonitor: ObservableObject {
             }
             mode = .manual
             settings.startupMode = activePresetID == nil ? .manual : .preset
+            beginControl()
             sendTargets()
 
         case .auto:
@@ -287,6 +404,7 @@ final class FanMonitor: ObservableObject {
             return
         }
         mode = .manual
+        beginControl()
         sendTargets()
     }
 
@@ -310,13 +428,17 @@ final class FanMonitor: ObservableObject {
         activePresetID = nil
         if mode == .manual {
             settings.startupMode = .manual
+            // Immediate: dragging the slider has to move the fans now, not over
+            // the next half minute the rate limiter would otherwise impose.
+            beginControl()
             sendTargets()
         }
         objectWillChange.send()
     }
 
-    /// Resolved target for one fan, from that fan's current percentage.
-    func target(for fan: Fan) -> Double { fan.rpm(forPercent: percent(for: fan)) }
+    /// Resolved target for one fan: what is actually commanded, not what was
+    /// asked for.
+    func target(for fan: Fan) -> Double { fan.rpm(forPercent: commandedPercent(for: fan)) }
 
     private func sendTargets() {
         guard mode == .manual, helper.status.isReady else { return }
@@ -332,8 +454,43 @@ final class FanMonitor: ObservableObject {
 
     // MARK: Failsafe
 
-    private func evaluateFailsafe(celsius: Double?) {
-        switch failsafe.evaluate(celsius: celsius, manualControlActive: mode == .manual) {
+    /// Hottest reading among the sensors the CPU failsafe deliberately excludes.
+    ///
+    /// `Temperature.swift` keeps battery and storage out of the CPU figure,
+    /// which is right as a definition of *CPU* temperature — but it also meant
+    /// nothing watched them at all. A laptop pinned to a low fan speed can cook
+    /// its battery long before the die reaches the cutoff: lithium-ion degrades
+    /// above roughly 45–60 °C, some 40 °C below the CPU trip.
+    private func hottest(_ snapshot: SystemSnapshot, matching fragments: [String]) -> Double? {
+        snapshot.sensors
+            .filter { sensor in
+                let name = sensor.name.lowercased()
+                return fragments.contains { name.contains($0) }
+            }
+            .map(\.celsius)
+            .filter { $0.isFinite && $0 > -50 && $0 < 200 }
+            .max()
+    }
+
+    private func evaluateFailsafe(snapshot: SystemSnapshot) {
+        // One place the user's setting enters the safety path, so it cannot go
+        // stale. Clamped again inside, whatever arrives.
+        failsafe.setTrip(settings.safetyCutoffCelsius)
+
+        // Zero by construction here — apply() has just stamped the timestamp.
+        // Staleness is judged in poll(), where a wedged queue cannot hide it.
+        let age: TimeInterval = 0
+        let input = FailsafeInput(
+            cpuCelsius: snapshot.cpuTemperature?.celsius,
+            hottestBatteryCelsius: hottest(snapshot, matching: ["batt", "gas gauge"]),
+            hottestStorageCelsius: hottest(snapshot, matching: ["nand", "ssd"]),
+            thermalState: ProcessInfo.processInfo.thermalState,
+            readingAge: age,
+            now: Date(),
+            manualControlActive: mode == .manual
+        )
+
+        switch failsafe.evaluate(input) {
         case .noChange:
             break
 
@@ -343,13 +500,14 @@ final class FanMonitor: ObservableObject {
             // changed, only the current safety state.
             mode = .auto
             failsafeMessage = reason.message
-            helper.setAllAuto()
+            releaseToAutomatic(reason: "failsafe")
 
         case .release:
             failsafeMessage = nil
             // Resume whatever was in force before the machine got hot.
             if settings.startupMode != .auto, helper.status.isReady {
                 mode = .manual
+                beginControl()
                 sendTargets()
             }
         }

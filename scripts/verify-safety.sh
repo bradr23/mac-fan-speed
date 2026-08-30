@@ -32,10 +32,10 @@ cleanup() {
     if [ -f "$FAILSAFE_SRC.orig" ]; then
         mv "$FAILSAFE_SRC.orig" "$FAILSAFE_SRC"
         echo ""
-        echo "Restoring the real 95 °C threshold and rebuilding…"
+        echo "Restoring the real threshold and rebuilding…"
         ./scripts/build.sh release >/dev/null 2>&1
-        grep -q "tripCelsius: Double = 95" "$FAILSAFE_SRC" \
-            && green "Failsafe threshold is back to 95 °C." \
+        grep -q "assumedCriticalCelsius: Double = 100" "$FAILSAFE_SRC" \
+            && green "Failsafe threshold is back to its shipped value." \
             || red "CHECK $FAILSAFE_SRC — the threshold may still be lowered!"
     fi
     "$FANCTL" auto >/dev/null 2>&1 || true
@@ -88,8 +88,26 @@ RESET=$(( IDLE - 5 ))
 echo "Idle is ${IDLE} °C; tripping at ${TRIP} °C so it fires immediately"
 
 cp "$FAILSAFE_SRC" "$FAILSAFE_SRC.orig"
-sed -i '' "s/tripCelsius: Double = 95/tripCelsius: Double = ${TRIP}/" "$FAILSAFE_SRC"
-sed -i '' "s/resetCelsius: Double = 85/resetCelsius: Double = ${RESET}/" "$FAILSAFE_SRC"
+
+# The trip point is derived: maximumTrip = assumedCritical - 5, and the default
+# is the maximum. Moving the one assumption therefore moves the whole ladder,
+# including past the 60 °C floor, because clampTrip lands on the maximum when the
+# maximum is the lower of the two bounds.
+#
+# This substitution MUST fail loudly. An earlier version patched a constant that
+# had since been renamed: sed matched nothing, exited 0, and the script went on
+# to report that the failsafe had not fired — a green-looking run that proved
+# nothing at all.
+if ! grep -q "assumedCriticalCelsius: Double = 100" "$FAILSAFE_SRC"; then
+    red "Cannot find the threshold constant in $FAILSAFE_SRC."
+    red "It has been renamed; this script would silently test nothing. Fix it first."
+    exit 1
+fi
+sed -i '' "s/assumedCriticalCelsius: Double = 100/assumedCriticalCelsius: Double = $(( TRIP + 5 ))/" "$FAILSAFE_SRC"
+grep -q "assumedCriticalCelsius: Double = $(( TRIP + 5 ))" "$FAILSAFE_SRC" || {
+    red "The substitution did not apply. Refusing to report a result."
+    exit 1
+}
 ./scripts/build.sh release >/dev/null 2>&1
 
 OUT="$(MFS_TEST_MANUAL=55 "$APP" 2>&1)"

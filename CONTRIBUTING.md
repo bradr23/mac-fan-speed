@@ -52,8 +52,17 @@ These are binding. [SPEC.md](SPEC.md) explains the reasoning behind each.
 2. Every exit path — quit, crash, watchdog, sleep, stopping the daemon — ends
    with the fans under macOS control **and `Ftst` cleared**. Leaving `Ftst` set
    hands thermal management to a process that may no longer exist.
-3. The 95 °C failsafe is mandatory and not user-configurable. It outranks every
-   route into manual control, including restoring a saved preset at launch.
+3. The temperature failsafe is mandatory and **not user-raisable**. The ceiling
+   is 5 °C below `Failsafe.assumedCriticalCelsius` and is also the default, so
+   nothing a user can do makes a machine hotter than a stock install allows. It
+   outranks every route into manual control, including restoring a saved preset
+   at launch. `Failsafe.clampTrip` is the layer this rests on — the slider's
+   range and the settings clamps are conveniences on top of it.
+3a. The escalation floor (`ThermalGuard`) is hardcoded and applied as
+   `max(requested, floor)` to every manual path. `max` is monotone, so no curve,
+   slider position or corrupted preference can command a speed below it. It is a
+   *speed* mechanism inside manual control; the failsafe is a *mode* mechanism
+   that leaves it. Keep them separate — a bug in one must not disable the other.
 4. Losing temperature readings while fans are forced also returns them to macOS.
    Holding a manual speed blind is worse than giving up control.
 5. **Never assume hardware.** Fan count, RPM ranges, sensor names and even the

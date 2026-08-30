@@ -143,3 +143,124 @@ final class HistoryRangeTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(FanMonitor.historyLimit, neededSamples)
     }
 }
+
+/// Adding curves changed the stored shape of a preset. `PresetStore.load`
+/// treats any decode failure as "nothing saved" and falls back to the built-ins,
+/// so a schema change old data cannot satisfy would silently delete every preset
+/// the user had. These pin that down.
+@MainActor
+final class PresetMigrationTests: XCTestCase {
+
+    private func sandbox(_ name: String) -> UserDefaults {
+        let defaults = UserDefaults(suiteName: name)!
+        defaults.removePersistentDomain(forName: name)
+        return defaults
+    }
+
+    /// Exactly the JSON a 0.2.0 build wrote: no `curve` key at all.
+    private let legacyJSON = """
+    [{"id":"00000000-0000-0000-0000-000000000001","name":"Quiet","percent":0,"isBuiltIn":true},
+     {"id":"00000000-0000-0000-0000-000000000002","name":"Cool","percent":0.35,"isBuiltIn":true},
+     {"id":"00000000-0000-0000-0000-000000000003","name":"Max","percent":1,"isBuiltIn":true},
+     {"id":"11111111-2222-3333-4444-555555555555","name":"Mine","percent":0.42,"isBuiltIn":false}]
+    """
+
+    func testLegacyPresetsSurviveTheUpgrade() {
+        let name = "io.github.bradr23.MacFanSpeed.tests.migrate"
+        let defaults = sandbox(name)
+        defer { defaults.removePersistentDomain(forName: name) }
+        defaults.set(Data(legacyJSON.utf8), forKey: "fanPresets")
+
+        let store = PresetStore(defaults: defaults)
+
+        // The user's own preset is the one that would hurt most to lose.
+        let mine = store.presets.first { $0.name == "Mine" }
+        XCTAssertNotNil(mine, "a custom preset must survive the schema change")
+        XCTAssertEqual(mine?.percent, 0.42)
+        XCTAssertNil(mine?.curve, "a preset saved before curves stays a fixed speed")
+
+        // And the built-ins keep behaving exactly as they did.
+        XCTAssertEqual(store.preset(id: FanPreset.coolID)?.percent, 0.35)
+        XCTAssertNil(store.preset(id: FanPreset.coolID)?.curve)
+    }
+
+    func testUpgradeAddsTheCurveProfileWithoutTouchingTheOthers() {
+        let name = "io.github.bradr23.MacFanSpeed.tests.smart"
+        let defaults = sandbox(name)
+        defer { defaults.removePersistentDomain(forName: name) }
+        defaults.set(Data(legacyJSON.utf8), forKey: "fanPresets")
+
+        let store = PresetStore(defaults: defaults)
+        let smart = store.preset(id: FanPreset.smartID)
+        XCTAssertNotNil(smart, "the new built-in should be merged in")
+        XCTAssertNotNil(smart?.curve)
+        XCTAssertEqual(store.presets.count, 5, "nothing should be removed")
+    }
+
+    func testCurvesRoundTripThroughTheStore() {
+        let name = "io.github.bradr23.MacFanSpeed.tests.roundtrip"
+        let defaults = sandbox(name)
+        defer { defaults.removePersistentDomain(forName: name) }
+
+        let store = PresetStore(defaults: defaults)
+        var preset = store.presets.first { $0.curve == nil }!
+        preset.setUsesCurve(true)
+        preset.curve = FanCurve(points: [
+            CurvePoint(celsius: 30, percent: 0.15),
+            CurvePoint(celsius: 50, percent: 0.50),
+        ])
+        store.update(preset)
+
+        let reloaded = PresetStore(defaults: defaults).preset(id: preset.id)
+        XCTAssertEqual(reloaded?.curve?.points.count, 2)
+        XCTAssertEqual(reloaded?.curve?.percent(atCelsius: 40) ?? 0, 0.325, accuracy: 0.001)
+    }
+
+    /// A build that predates curves reads only `percent`, so it must find
+    /// something sensible there rather than a stale or default value.
+    func testCurveProfilesStillWriteAReadableFixedSpeed() {
+        let name = "io.github.bradr23.MacFanSpeed.tests.mirror"
+        let defaults = sandbox(name)
+        defer { defaults.removePersistentDomain(forName: name) }
+
+        let store = PresetStore(defaults: defaults)
+        var preset = store.presets.first { $0.curve == nil }!
+        preset.curve = FanCurve(points: [
+            CurvePoint(celsius: 30, percent: 0.2),
+            CurvePoint(celsius: 90, percent: 0.8),
+        ])
+        store.update(preset)
+
+        let stored = store.preset(id: preset.id)!
+        XCTAssertEqual(stored.percent, stored.curve!.mirroredPercent, accuracy: 0.001)
+        XCTAssertGreaterThan(stored.percent, 0)
+    }
+
+    func testSwitchingAProfileToACurveKeepsItsCurrentSpeed() {
+        var preset = FanPreset(name: "Test", percent: 0.4)
+        preset.setUsesCurve(true)
+        XCTAssertNotNil(preset.curve)
+        // The machine should not change behaviour the instant the toggle flips.
+        XCTAssertEqual(preset.curve!.percent(atCelsius: 40), 0.4, accuracy: 0.001)
+    }
+
+    func testSwitchingBackToFixedKeepsAComparableSpeed() {
+        var preset = FanPreset(name: "Test", percent: 0.4)
+        preset.setUsesCurve(true)
+        preset.setUsesCurve(false)
+        XCTAssertNil(preset.curve)
+        XCTAssertGreaterThan(preset.percent, 0)
+    }
+
+    /// Corrupt data must fall back to something usable rather than crashing or
+    /// producing an unevaluable curve.
+    func testCorruptStoredDataFallsBackToTheBuiltIns() {
+        let name = "io.github.bradr23.MacFanSpeed.tests.corrupt"
+        let defaults = sandbox(name)
+        defer { defaults.removePersistentDomain(forName: name) }
+        defaults.set(Data("not json at all".utf8), forKey: "fanPresets")
+
+        let store = PresetStore(defaults: defaults)
+        XCTAssertEqual(store.presets.count, FanPreset.builtIns.count)
+    }
+}
