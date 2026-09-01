@@ -2,6 +2,32 @@
 
 Notable changes in each release. Versions follow [semantic versioning](https://semver.org).
 
+## 0.4.1
+
+### Fixed
+
+- **The app stopped controlling fans after sleep and never resumed.** The
+  stale-readings watchdog added in 0.3.0 compares the age of the last sensor
+  snapshot against a threshold of six seconds. That is right for the failure it
+  was written for — a poll queue that has wedged while the app carries on — but a
+  process that was *suspended*, because the machine slept or App Nap froze its
+  timer, resumes holding an equally old timestamp for an entirely innocent
+  reason. The check could not tell the two apart, so every sleep looked like a
+  stalled control loop.
+
+  Worse, the trip bypassed `Failsafe` and set the mode directly, so the failsafe
+  never knew it had happened and never issued the release that restores manual
+  control. It was a one-way door: after waking, the app sat in Auto showing
+  "Temperature readings stopped updating N s ago" until someone clicked a preset.
+
+  A wedged queue is now distinguished from a suspension by whether `poll()`
+  itself also stopped — a wedge leaves the poll timer running and is caught
+  within a couple of ticks, while a suspension shows up as a gap in both. The
+  trip is routed through `Failsafe` so it is recorded and can be released, and
+  the app additionally resets its clocks on `NSWorkspace.didWakeNotification`,
+  which — unlike in the daemon, where the equivalent notification never arrives —
+  does reach an app with a user session.
+
 ## 0.4.0
 
 Security audit of 0.3.0, and its fixes. No privilege escalation was found; the

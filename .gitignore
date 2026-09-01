@@ -7,3 +7,9 @@ dist/
 
 # Local development context, not published
 CLAUDE.md
+
+# Large archives dropped into the tree for local testing. A 485 MB Geekbench
+# zip was swept into a commit by `git add -A` and rejected by GitHub's 100 MB
+# limit; nothing in Resources/ but the app's own assets belongs in git.
+Resources/*.zip
+*.dmg

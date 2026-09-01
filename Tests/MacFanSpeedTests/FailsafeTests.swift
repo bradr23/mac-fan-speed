@@ -268,3 +268,59 @@ final class FailsafeAuthorityTests: XCTestCase {
         XCTAssertEqual(failsafe.evaluate(input(cpu: 84, manual: false)), .release)
     }
 }
+
+/// The staleness rule shipped in 0.3.0 knocked the app out of manual control
+/// after every sleep and never put it back. Both halves are pinned here.
+final class StaleReadingRecoveryTests: XCTestCase {
+
+    private func input(
+        cpu: Double? = 40, age: TimeInterval = 0, manual: Bool = true,
+        now: Date = Date(timeIntervalSince1970: 1_000_000)
+    ) -> FailsafeInput {
+        var i = FailsafeInput(cpuCelsius: cpu, manualControlActive: manual)
+        i.readingAge = age
+        i.now = now
+        return i
+    }
+
+    /// The trip has to be *recorded* in the failsafe. Setting the mode directly
+    /// — which is what the app did — left the failsafe believing nothing had
+    /// happened, so it never issued the release that restores manual control,
+    /// and only a click could bring the app back.
+    func testAStaleTripIsRecordedSoItCanBeReleased() {
+        var failsafe = Failsafe()
+        let outcome = failsafe.evaluate(input(cpu: 40, age: 944))
+        guard case .trip(.readingsStale) = outcome else {
+            return XCTFail("expected a stale trip, got \(outcome)")
+        }
+        XCTAssertTrue(failsafe.isTripped, "the failsafe must know, or it can never recover")
+    }
+
+    /// Once snapshots resume, the app must return to manual on its own.
+    func testFreshReadingsReleaseTheStaleTrip() {
+        var failsafe = Failsafe()
+        _ = failsafe.evaluate(input(cpu: 40, age: 944))
+        XCTAssertEqual(
+            failsafe.evaluate(input(cpu: 40, age: 0, manual: false)), .release,
+            "a fresh reading on a cool machine must restore control without a click"
+        )
+        XCTAssertFalse(failsafe.isTripped)
+    }
+
+    /// A stale trip is about the *loop*, not the temperature, so a cool machine
+    /// recovers immediately rather than waiting for a hysteresis band.
+    func testRecoveryDoesNotWaitForCooling() {
+        var failsafe = Failsafe()
+        _ = failsafe.evaluate(input(cpu: 35, age: 900))
+        XCTAssertEqual(failsafe.evaluate(input(cpu: 35, age: 0, manual: false)), .release)
+    }
+
+    /// Still genuinely stale: no release.
+    func testDoesNotReleaseWhileReadingsAreStillStale() {
+        var failsafe = Failsafe()
+        _ = failsafe.evaluate(input(cpu: 40, age: 944))
+        XCTAssertEqual(
+            failsafe.evaluate(input(cpu: 40, age: 500, manual: false)), .noChange
+        )
+    }
+}

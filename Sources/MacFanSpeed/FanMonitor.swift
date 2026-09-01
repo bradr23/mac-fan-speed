@@ -80,6 +80,14 @@ final class FanMonitor: ObservableObject {
     /// loop that stops while the UI keeps showing its last comfortable value is
     /// a documented failure mode in this class of app.
     private var lastSnapshotAt: Date?
+    /// When `poll()` itself last ran.
+    ///
+    /// The staleness check compares snapshots against *this*, not against the
+    /// wall clock alone. A process that was suspended — the machine slept, or
+    /// App Nap froze the timer — resumes with an arbitrarily old snapshot
+    /// timestamp through no fault of the poll queue, and treating that as a
+    /// wedged loop made the app drop to Auto after every sleep.
+    private var lastPollAt: Date?
 
     /// The curve last handed to the controller, so an edit can be detected and
     /// applied immediately rather than waiting for the temperature to drift.
@@ -141,11 +149,34 @@ final class FanMonitor: ObservableObject {
         // for as long as the dropdown is open.
         RunLoop.main.add(timer, forMode: .common)
         self.timer = timer
+
+        // Belt and braces alongside the gap detection in checkForStaleReadings.
+        // Unlike the daemon — where this notification never arrives, because a
+        // system-domain LaunchDaemon has no user session — the app does receive
+        // it, so a wake can be handled explicitly rather than only inferred.
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in self?.handleWake() }
+        }
     }
 
     func stop() {
         timer?.invalidate()
         timer = nil
+        NSWorkspace.shared.notificationCenter.removeObserver(self)
+    }
+
+    /// Sleep is a legitimate gap, not a stalled control loop.
+    ///
+    /// The daemon hands the fans back on the way into sleep, so on waking the app
+    /// has to take them again — which it does through the ordinary poll, provided
+    /// nothing has spuriously knocked it out of manual mode first.
+    private func handleWake() {
+        lastSnapshotAt = Date()
+        lastPollAt = Date()
+        curveController.reset(to: settings.manualPercent)
+        poll()
     }
 
     private func poll() {
@@ -157,6 +188,7 @@ final class FanMonitor: ObservableObject {
         // this rule is a control loop that has stopped while the UI keeps
         // showing its last comfortable reading.
         checkForStaleReadings()
+        lastPollAt = Date()
 
         pollQueue.async { [weak self] in
             let snapshot = monitor.snapshot()
@@ -164,15 +196,47 @@ final class FanMonitor: ObservableObject {
         }
     }
 
-    /// Hand the fans back if snapshots have stopped arriving.
+    /// Hand the fans back if snapshots have stopped arriving *while the app was
+    /// running*.
+    ///
+    /// The distinction matters. This check exists for a poll queue that has
+    /// wedged while the app carries on — a real failure mode where the UI keeps
+    /// showing its last comfortable reading. But a suspended process resumes with
+    /// an equally old timestamp for an entirely innocent reason, and the first
+    /// version could not tell the two apart: every sleep looked like a wedged
+    /// loop, so the app dropped to Auto on waking and, because this bypassed
+    /// `Failsafe` entirely, nothing ever put it back.
+    ///
+    /// A wedged queue is caught within a couple of polls, because `poll()` keeps
+    /// running and its own clock stays current. A suspension shows up as a gap in
+    /// `poll()` *as well*, and that is the signature used here.
     private func checkForStaleReadings() {
-        guard mode == .manual, let last = lastSnapshotAt else { return }
-        let age = Date().timeIntervalSince(last)
+        guard mode == .manual, let lastSnapshot = lastSnapshotAt else { return }
+        let now = Date()
+
+        // The whole process was away: not a wedge, and not this check's business.
+        if let lastPoll = lastPollAt,
+           now.timeIntervalSince(lastPoll) > Self.pollInterval * 3 {
+            lastSnapshotAt = now
+            return
+        }
+
+        let age = now.timeIntervalSince(lastSnapshot)
         guard age > Failsafe.staleReadingSeconds else { return }
 
-        mode = .auto
-        failsafeMessage = Failsafe.Reason.readingsStale(age).message
-        releaseToAutomatic(reason: "stale readings")
+        // Routed through the failsafe rather than setting `mode` directly, so
+        // that the trip is *recorded* and its release path can fire when
+        // snapshots resume. Setting the mode here on its own was a one-way door:
+        // `Failsafe` never knew it had tripped, so it never issued the `.release`
+        // that would have restored manual control, and only a click could.
+        var input = FailsafeInput(cpuCelsius: cpu?.celsius, manualControlActive: true)
+        input.readingAge = age
+        input.now = now
+        if case .trip(let reason) = failsafe.evaluate(input) {
+            mode = .auto
+            failsafeMessage = reason.message
+            releaseToAutomatic(reason: "stale readings")
+        }
     }
 
     /// Ask the daemon for automatic control and report if it refuses.
