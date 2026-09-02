@@ -46,7 +46,7 @@ Built-ins: **Quiet** 0 % (fan minimum), **Cool** 35 %, **Max** 100 %. The UI sho
 - **Preset**: a named percentage set; internally identical to Manual once resolved.
 
 ### Temperature failsafe (mandatory, lowerable but never raisable)
-- Hottest CPU sensor ≥ **95 °C** → immediately revert to Auto and show a warning state in the menu bar (`⚠︎ 96°`).
+- Hottest CPU sensor ≥ the configured cutoff (default **95 °C**) → immediately revert to Auto. The reason is shown in the dropdown; there is no separate menu bar warning glyph, and the label keeps its ordinary `temp rpm` form.
 - Stay in Auto until temp < **85 °C** (hysteresis), then restore the user's previous mode.
 - Constants in code: `Failsafe.assumedCriticalCelsius = 100`, `maximumTripCelsius = 95`
   (the ceiling *and* the default), `minimumTripCelsius = 60`, reset derived as
@@ -63,7 +63,7 @@ Built-ins: **Quiet** 0 % (fan minimum), **Cool** 35 %, **Max** 100 %. The UI sho
   `ProcessInfo.thermalState` at `.serious`/`.critical`. The last is
   supplementary only — `NSProcessInfo` documents that an unknown or unsupported
   thermal state reads `.nominal`, so it can never be evidence of safety.
-- Also trips if temperature reads become unavailable while in Manual — no sensor means no safe manual control.
+- Also trips if temperature reads become unavailable while in Manual — no sensor means no safe manual control. Three consecutive misses, not one: the HID reader returns empty whenever its service copy fails once, and handing the fans back for that hiccup was worse than tolerating it. While readings are missing the curve asks for full speed, so the untolerated direction is louder, never hotter.
 
 ### Settings window
 A real window, opened from **Settings…** in the dropdown, with four tabs:
@@ -212,7 +212,7 @@ Apple Silicon CPU temperatures are not in classic SMC keys. Read them through `I
 **Sensor names differ across chip generations and variants, so they must not be hardcoded to one machine.** Classify discovered sensors into tiers, most specific first:
 
 1. **`coreCluster`** — names containing `ACC MTR Temp`, the per-core clusters (`pACC` performance, `eACC` efficiency).
-2. **`socDie`** — names containing `SOC MTR Temp`, `PMU tdev` or `PMU tdie`.
+2. **`socDie`** — names containing `SOC MTR Temp` or `PMU tdie`. **`PMU tdev` is not in this tier**: it is excluded by name in `excludedFragments` before classification ever runs, because it reads garbage (≈ −21.7 on M1, ≈ −9201 on M4 Pro). Listing it here as a tier the failsafe reads described the opposite of the code.
 3. **`unclassified`** — anything not recognised and not excluded.
 4. **`excluded`** — known non-CPU sensors: `batt`, `NAND`, `charger`, `ambient`, `gas gauge`, `PMU tcal`, `display`, `airport`, `wifi`, `camera`, `speaker`.
 

@@ -91,99 +91,46 @@ final class DaemonHardeningTests: XCTestCase {
     }
 }
 
-/// Regressions for defects introduced by the security fixes themselves and
-/// caught in review. The daemon's state machine is transcribed here because the
-/// real one only runs as root; these pin the logic, and
-/// scripts/verify-safety.sh exercises the real thing on hardware.
-final class DaemonLockoutTests: XCTestCase {
+/// Fixes from the v0.4.1 full audit that live in the shared layer.
+final class AuditFixTests: XCTestCase {
 
-    /// Mirrors FanService's thermal state machine.
-    private struct Machine {
-        var sensingProven = false
-        var thermalLockout = false
-        var missed = 0
-        let missesBeforeLost = 3
+    /// `?? 0` made an unreadable mode indistinguishable from a genuine 0, and
+    /// that value was cached as the automatic baseline and written back on every
+    /// restore — setting a mode the machine never had.
+    func testAnUnreportedModeIsFlagged() {
+        let reported = Fan(index: 0, actualRPM: 100, minRPM: 1, maxRPM: 2,
+                           targetRPM: 1, modeRaw: 3)
+        XCTAssertTrue(reported.modeReported, "the default must stay true for existing callers")
 
-        mutating func startupRead(_ celsius: Double?) {
-            if celsius != nil { sensingProven = true }
-        }
-        /// Returns whether the watch actually started.
-        func watchWouldStart() -> Bool { sensingProven }
-
-        mutating func tick(_ celsius: Double?) {
-            guard let celsius else {
-                missed += 1
-                guard missed >= missesBeforeLost else { return }
-                sensingProven = false          // degrade, do NOT latch
-                return
-            }
-            missed = 0
-            sensingProven = true
-            if celsius >= ThermalLimits.daemonTripCelsius { thermalLockout = true }
-        }
-
-        mutating func recoveryTick(_ celsius: Double?) {
-            guard let celsius else { return }
-            if !sensingProven { sensingProven = true; missed = 0 }
-            if thermalLockout, celsius < ThermalLimits.daemonResetCelsius {
-                thermalLockout = false
-            }
-        }
-        var refusesControl: Bool { thermalLockout }
+        let unreported = Fan(index: 0, actualRPM: 100, minRPM: 1, maxRPM: 2,
+                             targetRPM: 1, modeRaw: 0, limitsReported: true,
+                             modeReported: false)
+        XCTAssertFalse(unreported.modeReported)
     }
 
-    /// The bug: the watch was gated on "a HID client exists" but tripped on "a
-    /// reading arrived". On a Mac where the first is true and the second never
-    /// is, the daemon latched a lockout it could never lift — killing fan
-    /// control for the life of the daemon, and blaming heat for it.
-    func testAMachineThatNeverReadsTemperaturesDoesNotStartTheWatch() {
-        var m = Machine()
-        m.startupRead(nil)
-        XCTAssertFalse(m.watchWouldStart(), "a watch that can never read must not run")
-        XCTAssertFalse(m.refusesControl)
+    /// Errors that describe an unreadable fan must survive being formatted, since
+    /// the values reaching them are the untrustworthy ones. `Int(Double.nan)`
+    /// traps, which would crash the root daemon while reporting a fault.
+    func testEveryFanControlErrorFormatsNonFiniteValues() {
+        let messages = [
+            FanControlError.implausibleRange(0, .nan, .infinity).description,
+            FanControlError.invalidTarget(0, .nan).description,
+            FanControlError.limitsUnknown(0).description,
+            FanControlError.noBaselineRecorded(0).description,
+            FanControlError.writeRejected("F0Md", 130).description,
+            FanControlError.unwritableType("F0Md", "ui8 ").description,
+            FanControlError.invalidFanIndex(99).description,
+            FanControlError.notRoot.description,
+        ]
+        for message in messages { XCTAssertFalse(message.isEmpty) }
     }
 
-    /// A single failed read must not be treated as a lost sensor: the reader
-    /// returns empty if the service copy fails once, on any Mac.
-    func testOneMissedReadingIsTolerated() {
-        var m = Machine()
-        m.startupRead(50)
-        m.tick(nil)
-        XCTAssertTrue(m.sensingProven)
-        XCTAssertFalse(m.refusesControl)
-    }
-
-    /// Losing readings degrades the daemon's failsafe; it must never latch,
-    /// because the only thing that could lift the latch is the reading that is
-    /// missing.
-    func testLosingReadingsDegradesButNeverLatches() {
-        var m = Machine()
-        m.startupRead(50)
-        for _ in 0..<10 { m.tick(nil) }
-        XCTAssertFalse(m.sensingProven)
-        XCTAssertFalse(m.refusesControl, "a lost sensor must not brick fan control")
-    }
-
-    func testSensorsComingBackReArmTheFailsafe() {
-        var m = Machine()
-        m.startupRead(50)
-        for _ in 0..<5 { m.tick(nil) }
-        XCTAssertFalse(m.sensingProven)
-        m.recoveryTick(45)
-        XCTAssertTrue(m.sensingProven, "readings returning must restore protection")
-    }
-
-    /// Heat is the one thing that does latch, and only cooling lifts it.
-    func testHeatLatchesAndOnlyCoolingLiftsIt() {
-        var m = Machine()
-        m.startupRead(50)
-        m.tick(ThermalLimits.daemonTripCelsius + 1)
-        XCTAssertTrue(m.refusesControl)
-
-        m.recoveryTick(ThermalLimits.daemonTripCelsius - 1)
-        XCTAssertTrue(m.refusesControl, "still above the reset point")
-
-        m.recoveryTick(ThermalLimits.daemonResetCelsius - 1)
-        XCTAssertFalse(m.refusesControl, "cooled — control must return")
+    /// The daemon compiles in its own ceiling and must never take one from a
+    /// client, so the app's settable range has to sit at or below it.
+    func testNoSettableCutoffExceedsTheDaemonCeiling() {
+        XCTAssertEqual(ThermalLimits.settableRange.upperBound,
+                       ThermalLimits.daemonTripCelsius)
+        XCTAssertLessThan(ThermalLimits.settableRange.upperBound,
+                          ThermalLimits.assumedCriticalCelsius)
     }
 }

@@ -234,7 +234,8 @@ private struct PresetSettings: View {
 
             List(selection: $selection) {
                 ForEach(presets.presets) { preset in
-                    PresetRow(preset: preset, presets: presets, fans: monitor.fans)
+                    PresetRow(preset: preset, presets: presets, fans: monitor.fans,
+                              onEdit: { monitor.activePresetChanged(preset.id) })
                         .tag(preset.id)
                 }
             }
@@ -300,6 +301,7 @@ private struct PresetSettings: View {
                     var copy = preset
                     copy.setUsesCurve(usesCurve)
                     presets.update(copy)
+                    monitor.activePresetChanged(preset.id)
                 }
             ))
             .font(.callout)
@@ -312,6 +314,7 @@ private struct PresetSettings: View {
                             var copy = preset
                             copy.curve = updated
                             presets.update(copy)
+                            monitor.activePresetChanged(preset.id)
                         }
                     ),
                     fans: monitor.fans,
@@ -334,6 +337,9 @@ private struct PresetRow: View {
     let preset: FanPreset
     @ObservedObject var presets: PresetStore
     let fans: [Fan]
+    /// Called after any edit, so a change to the profile that is currently
+    /// running reaches the fans instead of waiting to be reselected.
+    let onEdit: () -> Void
 
     var body: some View {
         HStack(spacing: 10) {
@@ -347,7 +353,12 @@ private struct PresetRow: View {
             Slider(
                 value: Binding(
                     get: { preset.percent },
-                    set: { var copy = preset; copy.percent = $0; presets.update(copy) }
+                    set: {
+                        var copy = preset
+                        copy.percent = $0
+                        presets.update(copy)
+                        onEdit()
+                    }
                 ),
                 in: 0...1
             )

@@ -223,7 +223,9 @@ struct CurveController {
         filteredCelsius = filtered
 
         // Without a temperature there is no curve to evaluate and no floor to
-        // interpolate; ask for everything until the failsafe takes over.
+        // interpolate; ask for everything until the failsafe takes over. That is
+        // up to three polls, not one — see `ThermalGuard.percent(atCelsius:)` for
+        // why the miss tolerance makes this window six seconds wide.
         guard let filtered else {
             driver = .thermalGuard(requested: requested, celsius: .nan)
             return slew.step(towards: 1, now: now, tuning: tuning, immediate: immediate)

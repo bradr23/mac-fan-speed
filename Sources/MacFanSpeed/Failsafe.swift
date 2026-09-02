@@ -134,6 +134,17 @@ struct Failsafe {
         }
     }
 
+    /// Consecutive ticks with no usable reading.
+    ///
+    /// A single miss is not a lost sensor: the reader returns empty if the HID
+    /// service copy fails once, which happens on any Mac. Tripping on the first
+    /// one handed the fans back for a hiccup — and on a machine that is genuinely
+    /// warm the release then needs a reading below the reset point, so a
+    /// momentary glitch could hold the app in Auto far longer than the glitch.
+    private var missedReadings = 0
+    /// Matches the daemon's tolerance, for the same reason.
+    static let missesBeforeSensorsLost = 3
+
     private(set) var trippedReason: Reason?
     private var heatBandEntered: Date?
 
@@ -150,7 +161,21 @@ struct Failsafe {
     /// Order matters only in that the first matching rule wins the message; any
     /// of them tripping has the same effect.
     mutating func evaluate(_ input: FailsafeInput) -> Outcome {
-        trackSustainedHeat(input)
+        // Dwell is time spent hot *under this app's control*. Accumulating it
+        // while macOS owns the fans meant a machine that had been warm on its own
+        // handed a freshly-enabled manual mode a timer that was already expired,
+        // and it tripped on its first tick — blaming the user's setting for heat
+        // that predated it.
+        if input.manualControlActive || isTripped {
+            trackSustainedHeat(input)
+        } else {
+            heatBandEntered = nil
+            // Misses are consecutive ticks *of one manual session*. Carried
+            // across a spell in Auto, two misses at the end of one session plus
+            // one at the start of the next tripped on the first tick — so a fresh
+            // session never got the tolerance the constant advertises.
+            missedReadings = 0
+        }
 
         if isTripped {
             // Release needs a real, current reading below the reset point and
@@ -173,6 +198,7 @@ struct Failsafe {
 
             trippedReason = nil
             heatBandEntered = nil
+            missedReadings = 0
             return .release
         }
 
@@ -183,8 +209,11 @@ struct Failsafe {
             return trip(.readingsStale(input.readingAge))
         }
         guard let celsius = input.cpuCelsius, celsius.isFinite else {
+            missedReadings += 1
+            guard missedReadings >= Self.missesBeforeSensorsLost else { return .noChange }
             return trip(.temperatureUnavailable)
         }
+        missedReadings = 0
         if celsius >= tripCelsius { return trip(.tooHot(celsius)) }
         if let battery = input.hottestBatteryCelsius, battery >= Self.batteryTripCelsius {
             return trip(.batteryTooHot(battery))

@@ -38,6 +38,14 @@ final class FanService {
     /// a fan again. See `shutdownAndRestore`.
     private var isShuttingDown = false
 
+    /// Set across a sleep restore, so a request that was already in flight cannot
+    /// re-take the fans between the restore and the machine actually going down.
+    ///
+    /// The app re-sends its target every two seconds and does not know sleep is
+    /// happening, so without this the daemon reliably handed the fans back and
+    /// then had them taken straight off it again — while sleeping.
+    private var isSuspending = false
+
     /// Live XPC connections, and which one currently owns the forced fans.
     ///
     /// Ownership matters: releasing on the *last* disconnect (0.2.0) stopped a
@@ -52,26 +60,10 @@ final class FanService {
     private var temperatures: TemperatureReader?
     private var thermalTimer: DispatchSourceTimer?
     private var recoveryTimer: DispatchSourceTimer?
-    /// Set when the daemon's own failsafe has fired on a real temperature;
-    /// cleared once genuinely cool.
-    ///
-    /// Only heat latches this. Losing readings does not — see `checkTemperature`.
-    private var thermalLockout = false
-
-    /// Whether a temperature has ever actually been read.
-    ///
-    /// `TemperatureReader.isAvailable` only says the HID client object exists,
-    /// which is nearly always true; it says nothing about whether any sensor
-    /// enumerates. Gating the watch on availability while tripping it on an
-    /// actual reading meant the two tested different things, and on a machine
-    /// that creates a client but reads nothing the daemon locked itself out of
-    /// fan control permanently after one tick.
-    private var sensingProven = false
-
-    /// Consecutive failed reads. One transient miss must not be treated as a
-    /// lost sensor — `readAll()` returns empty if the service copy fails once.
-    private var missedReadings = 0
-    static let missesBeforeLost = 3
+    private var suspendTimer: DispatchSourceTimer?
+    /// All thermal decision-making, in a value type that lives in SMCKit so it
+    /// can actually be tested — this executable target is in no test bundle.
+    private var thermal = ThermalWatchState()
 
     private init() {}
 
@@ -104,8 +96,9 @@ final class FanService {
                 // never called, and that failure was invisible for weeks.
                 let reader = TemperatureReader()
                 self.temperatures = reader
-                if let hottest = reader.hottestCPU() {
-                    self.sensingProven = true
+                let firstReading = reader.hottestCPU()
+                self.thermal.observeStartup(celsius: firstReading?.celsius)
+                if let hottest = firstReading {
                     log(String(
                         format: "independent failsafe ACTIVE — %@ reads %.1f °C, "
                               + "ceiling %.0f °C",
@@ -125,6 +118,7 @@ final class FanService {
     func setFan(index: Int, targetRPM: Double, client: ObjectIdentifier?) -> String? {
         queue.sync {
             guard !isShuttingDown else { return "helper is shutting down" }
+            guard !isSuspending else { return "the machine is going to sleep" }
             guard let controller else { return "helper has no SMC connection" }
 
             // Validated here as well as in FanController: this is the boundary
@@ -137,10 +131,7 @@ final class FanService {
 
             // The daemon's own failsafe outranks any client. While it holds, no
             // request may force a fan, however well-formed or well-signed.
-            if thermalLockout {
-                return "too hot — the helper has returned the fans to macOS"
-            }
-            if let blocked = temperatureBlockingControl() {
+            if let blocked = thermal.refusalReason(celsius: currentCelsius()) {
                 return blocked
             }
 
@@ -160,10 +151,17 @@ final class FanService {
                 // where the fans are being taken over. A machine that crossed
                 // the ceiling while we were unlocking would otherwise not be
                 // noticed until the next tick.
-                if let blocked = temperatureBlockingControl() {
-                    thermalLockout = true
-                    performRestore(reason: "too hot on completing the fan write")
-                    return blocked
+                //
+                // `observeHeat`, not `step`: this is a client request, not a tick
+                // of the watch, and it must not advance the missed-reading
+                // counter. It used to, and on a Mac whose daemon cannot read
+                // temperatures — where the watch never runs, so this was the only
+                // caller — three requests were enough to make every later one
+                // force the fans and instantly release them, forever.
+                if case .release(let reason) = thermal.observeHeat(celsius: currentCelsius()) {
+                    performRestore(reason: "\(reason.logDescription) on completing the fan write")
+                    return thermal.refusalReason(celsius: currentCelsius())
+                        ?? "too hot on completing the fan write"
                 }
                 if !result.targetAccepted {
                     return String(
@@ -175,23 +173,65 @@ final class FanService {
                 }
                 return nil
             } catch {
+                // A throw does NOT mean nothing happened. setTarget writes the
+                // firmware unlock first, then the mode, then the target, and the
+                // two later writes can each throw. Returning the error and
+                // nothing else left the machine with thermal management yielded
+                // — and possibly a fan pinned — while the daemon still believed
+                // it owned nothing. Every restore path is gated on
+                // `hasForcedFans`, so that one omission switched off the
+                // watchdog, the disconnect restore, sleep, SIGTERM and the
+                // daemon's own failsafe simultaneously.
+                //
+                // Ownership therefore begins at the first hardware write, not
+                // at success. `firmwareUnlocked` used to be the test, and it is
+                // fail-open exactly where it matters: it reads `Ftst`, and
+                // answers false both on hardware that has no such key — where
+                // `setTarget` still writes the forced mode — and when the
+                // confirming read merely failed. `mayHoldFans` is set by the
+                // writer itself, before the first write, so it cannot be wrong
+                // in that direction.
+                if controller.mayHoldFans {
+                    if !hasForcedFans {
+                        log("setFan failed with the firmware still yielded — "
+                            + "arming supervision so the restore paths can recover")
+                    }
+                    hasForcedFans = true
+                    if owner == nil { owner = client }
+                    restartWatchdog()
+                    startThermalWatch()
+                }
                 return "\(error)"
             }
         }
     }
 
+    /// Hand the fans back at a client's request.
+    ///
+    /// Delegates to `performRestore` rather than open-coding a second restore.
+    /// It used to be its own implementation, and when the fix for "a failed
+    /// restore must not disarm supervision" landed it was applied to only one of
+    /// the two — leaving the path that every app-initiated release actually uses
+    /// (clicking Auto, a failsafe trip, quitting) clearing `hasForcedFans` before
+    /// it had looked at whether the restore worked. Every other restore path is
+    /// gated on that flag, so failing here switched all of them off at once.
+    ///
+    /// `force` is what makes this correct after a daemon restart. `hasForcedFans`
+    /// is per-process state, so a daemon that was replaced (`install-helper.sh`),
+    /// kickstarted, or that crashed while the app held the fans starts life
+    /// believing it owns nothing — while the hardware is still forced. Delegating
+    /// without it meant every client-facing way of handing the fans back returned
+    /// success for doing nothing, in exactly the crash-recovery case the
+    /// persisted baseline was added to survive.
     func setAllAuto() -> String? {
         queue.sync {
-            guard let controller else { return "helper has no SMC connection" }
-            cancelWatchdog()
-            stopThermalWatch()
-            let failures = controller.restoreAllAutomatic()
-            hasForcedFans = false
-            owner = nil
+            guard controller != nil else { return "helper has no SMC connection" }
+            let failures = performRestore(
+                reason: "client asked for automatic control", force: true
+            )
             guard failures.isEmpty else {
                 return failures.map { "fan \($0.key): \($0.value)" }.joined(separator: "; ")
             }
-            log("all fans returned to automatic control")
             return nil
         }
     }
@@ -217,7 +257,47 @@ final class FanService {
     /// clearing `Ftst` while the other was still writing modes, which makes those
     /// writes fail for their entire retry window and leaves the fans forced.
     func emergencyRestore(reason: String) {
-        queue.sync { performRestore(reason: reason) }
+        queue.sync { _ = performRestore(reason: reason) }
+    }
+
+    /// Restore for sleep, refusing new requests until the machine wakes.
+    ///
+    /// Unlike `shutdownAndRestore` this is reversible: `resumeAfterWake` lifts it.
+    func suspendAndRestore(reason: String) {
+        queue.sync {
+            isSuspending = true
+            performRestore(reason: reason)
+
+            // A gate that only a wake message can lift is a gate that refuses
+            // everything forever if that message never arrives — and "a
+            // notification that silently never fires" is this project's most
+            // repeated bug. The wake path clears it promptly; this only bounds
+            // the damage if it does not.
+            let timer = DispatchSource.makeTimerSource(queue: queue)
+            timer.schedule(deadline: .now() + Self.suspendGateTimeout)
+            timer.setEventHandler { [weak self] in
+                guard let self, self.isSuspending else { return }
+                log("no wake notification after \(Int(Self.suspendGateTimeout))s — "
+                    + "lifting the sleep gate anyway")
+                self.isSuspending = false
+            }
+            timer.resume()
+            suspendTimer = timer
+        }
+    }
+
+    /// How long the sleep gate may hold without a wake message.
+    static let suspendGateTimeout: TimeInterval = 120
+
+    /// Accept requests again after a wake.
+    func resumeAfterWake() {
+        queue.sync {
+            suspendTimer?.cancel()
+            suspendTimer = nil
+            guard isSuspending else { return }
+            isSuspending = false
+            log("awake — accepting fan requests again")
+        }
     }
 
     // MARK: Client tracking
@@ -228,15 +308,19 @@ final class FanService {
     }
 
 
-    /// Release the fans, but only once *every* client has gone.
+    /// Release the fans when the client that **forced** them disconnects.
     ///
-    /// Restoring on any disconnect is wrong whenever more than one client exists,
-    /// and more than one is routine: every `fanctl` invocation opens its own
-    /// connection, and the diagnostics this project asks people to run in bug
-    /// reports are `fanctl` commands. Running `fanctl helper-status` while a
-    /// preset was active used to knock the fans straight back to automatic — the
-    /// app was still connected and still sending its target, but a short-lived
-    /// second client had just exited.
+    /// Not when the last of any clients does — that was 0.2.0's rule, and this
+    /// comment described it for a release after the code had stopped doing it.
+    ///
+    /// The history is worth keeping because both wrong answers were tried.
+    /// Releasing on *any* disconnect broke the common case: every `fanctl`
+    /// invocation opens its own connection, and the diagnostics this project asks
+    /// people to paste into bug reports are `fanctl` commands, so running
+    /// `fanctl helper-status` while a preset was active knocked the fans straight
+    /// back to automatic. Releasing only when *all* clients had gone then let an
+    /// unrelated connection hold someone else's fans for as long as it stayed
+    /// attached. Ownership is the answer to both.
     ///
     /// The watchdog is unaffected and remains the backstop for a client that dies
     /// without its connection being torn down.
@@ -281,8 +365,11 @@ final class FanService {
     }
 
     /// Must be called on `queue`.
-    private func performRestore(reason: String) {
-        guard hasForcedFans else { return }
+    /// - Returns: the failures the restore reported; empty means the fans are
+    ///   genuinely back under macOS control.
+    @discardableResult
+    private func performRestore(reason: String, force: Bool = false) -> [Int: String] {
+        guard hasForcedFans || force else { return [:] }
         log("restoring automatic control (\(reason))")
 
         // Stop the other path from starting a competing restore.
@@ -297,7 +384,7 @@ final class FanService {
             owner = nil
             stopThermalWatch()
             log("fans returned to automatic control in \(elapsed)s")
-            return
+            return failures
         }
 
         // The restore FAILED, which means the fans may still be forced. Clearing
@@ -309,6 +396,16 @@ final class FanService {
         // So the state stands and the watchdog is re-armed to try again. The
         // exception is shutdown, where nothing will be left running to retry.
         log("restore finished in \(elapsed)s WITH PROBLEMS: \(failures)")
+        // A forced restore that failed on a machine that shows evidence of being
+        // held means a restarted daemon has met the hardware its predecessor
+        // left. Taking responsibility is what arms the retry. Without the
+        // evidence check this would also latch on a Mac that merely *rests* at
+        // the forced mode value, where the reclaim wait can never be satisfied.
+        if force, !hasForcedFans, controller?.fansAppearHeld == true {
+            log("the fans still appear to be held — taking ownership so the "
+                + "watchdog can retry the restore")
+            hasForcedFans = true
+        }
         if isShuttingDown {
             hasForcedFans = false
             owner = nil
@@ -319,6 +416,7 @@ final class FanService {
             restartWatchdog()
             startThermalWatch()
         }
+        return failures
     }
 
     // MARK: The daemon's own failsafe
@@ -326,18 +424,13 @@ final class FanService {
     /// How often the daemon checks the temperature while it is holding fans.
     static let thermalInterval: TimeInterval = 2
 
-    /// Why control must be refused right now, or nil if it may proceed.
+    /// The daemon's own current reading, or nil if it has none.
     ///
     /// Must be called on `queue`.
-    private func temperatureBlockingControl() -> String? {
-        guard let temperatures, temperatures.isAvailable else { return nil }
-        guard let hottest = temperatures.hottestCPU() else { return nil }
-        guard hottest.celsius.isFinite else { return nil }
-        guard hottest.celsius >= ThermalLimits.daemonTripCelsius else { return nil }
-        return String(
-            format: "too hot (%.0f °C, ceiling %.0f °C)",
-            hottest.celsius, ThermalLimits.daemonTripCelsius
-        )
+    private func currentCelsius() -> Double? {
+        guard let temperatures else { return nil }
+        guard let hottest = temperatures.hottestCPU(), hottest.celsius.isFinite else { return nil }
+        return hottest.celsius
     }
 
     /// Watch the temperature for as long as fans are forced.
@@ -350,9 +443,10 @@ final class FanService {
     ///
     /// Must be called on `queue`.
     private func startThermalWatch() {
-        // Proof, not availability: starting a watch that can never read anything
-        // is how the daemon used to trip its own lockout and never recover.
-        guard thermalTimer == nil, sensingProven, temperatures != nil else { return }
+        // Gated on sensing having been PROVEN, not on a client object existing.
+        // Starting a watch that can never read anything is how the daemon used to
+        // trip a lockout it could never lift.
+        guard thermalTimer == nil, thermal.shouldWatch, temperatures != nil else { return }
         let timer = DispatchSource.makeTimerSource(queue: queue)
         timer.schedule(deadline: .now() + Self.thermalInterval, repeating: Self.thermalInterval)
         timer.setEventHandler { [weak self] in self?.checkTemperature() }
@@ -368,57 +462,41 @@ final class FanService {
 
     /// Must be called on `queue`.
     private func checkTemperature() {
-        guard hasForcedFans, let temperatures else { return }
-        guard let hottest = temperatures.hottestCPU(), hottest.celsius.isFinite else {
-            missedReadings += 1
-            guard missedReadings >= Self.missesBeforeLost else { return }
-
-            // Holding a manual speed with no idea how hot the machine is is worse
-            // than giving control back, so the fans go to macOS — but this does
-            // NOT latch the lockout. A latch here can never lift, because the
-            // only thing that lifts it is the reading we just failed to get, and
-            // the result was a daemon that permanently refused fan control while
-            // blaming heat. Losing sensing degrades the daemon to its pre-0.3.0
-            // behaviour; it does not brick the feature.
+        guard hasForcedFans else { return }
+        switch thermal.step(celsius: currentCelsius()) {
+        case .none:
+            return
+        case .release(.readingsLost):
             log("lost temperature readings while holding fans — returning them to "
                 + "macOS; the daemon's own failsafe is inactive until readings return")
-            sensingProven = false
             performRestore(reason: "temperature readings lost")
-            return
-        }
-
-        missedReadings = 0
-        sensingProven = true
-
-        if hottest.celsius >= ThermalLimits.daemonTripCelsius {
+        case .release(.tooHot(let celsius)):
             log(String(
-                format: "FAILSAFE: %@ reached %.1f °C (ceiling %.0f) — returning fans to macOS",
-                hottest.name, hottest.celsius, ThermalLimits.daemonTripCelsius
+                format: "FAILSAFE: %.1f °C reached the %.0f °C ceiling — returning fans to macOS",
+                celsius, ThermalLimits.daemonTripCelsius
             ))
-            thermalLockout = true
             performRestore(reason: "daemon failsafe")
         }
     }
 
-    /// Clear the lockout once the machine is genuinely cool again.
+    /// Clear the lockout once the machine is genuinely cool again, and re-arm the
+    /// watch if sensing has come back.
     ///
-    /// Run from the watchdog-independent timer below so recovery does not depend
-    /// on a client asking.
+    /// Must be called on `queue`.
     private func releaseThermalLockoutIfCool() {
-        guard let temperatures else { return }
-        guard let hottest = temperatures.hottestCPU(), hottest.celsius.isFinite else { return }
+        let wasLockedOut = thermal.lockedOut
+        let regained = thermal.recoveryTick(celsius: currentCelsius())
 
-        // Any successful read re-arms the daemon's failsafe, so a machine whose
-        // sensors come back gets its protection back without a restart.
-        if !sensingProven {
-            sensingProven = true
-            missedReadings = 0
+        if regained {
             log("temperature readings returned — the daemon's own failsafe is active again")
+            // Re-arm immediately rather than waiting for the next setFan. Fans
+            // already held were otherwise left unsupervised until a client
+            // happened to send another request, which it may never do.
+            if hasForcedFans { startThermalWatch() }
         }
-
-        guard thermalLockout, hottest.celsius < ThermalLimits.daemonResetCelsius else { return }
-        thermalLockout = false
-        log(String(format: "cooled to %.1f °C — fan control available again", hottest.celsius))
+        if wasLockedOut, !thermal.lockedOut {
+            log("cooled below the reset point — fan control available again")
+        }
     }
 
     /// Slow tick that runs for the life of the daemon, so a lockout can lift even
@@ -646,6 +724,8 @@ private enum PowerMessage {
     static let canSystemSleep = iokitCommon | 0x270
     /// Sleep is happening; the system waits for an acknowledgement. `0xE0000280`.
     static let systemWillSleep = iokitCommon | 0x280
+    /// The machine is awake again. `0xE0000300`.
+    static let systemHasPoweredOn = iokitCommon | 0x300
 }
 
 /// Restore automatic control before the machine sleeps.
@@ -673,10 +753,13 @@ func observeSleep() {
             // 30 s, so allow it — the real work happens on WillSleep below.
             IOAllowPowerChange(powerRootPort, Int(bitPattern: messageArgument))
 
+        case PowerMessage.systemHasPoweredOn:
+            FanService.shared.resumeAfterWake()
+
         case PowerMessage.systemWillSleep:
             // Sleep waits for the acknowledgement, so the fans are handed back
             // before the machine goes down rather than racing it.
-            FanService.shared.emergencyRestore(reason: "system going to sleep")
+            FanService.shared.suspendAndRestore(reason: "system going to sleep")
             IOAllowPowerChange(powerRootPort, Int(bitPattern: messageArgument))
 
         default:

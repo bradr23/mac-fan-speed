@@ -123,6 +123,16 @@ public final class FanController: @unchecked Sendable {
     /// Mode value per fan before this process wrote anything.
     private var automaticBaseline: [Int: Double] = [:]
 
+    /// Whether this instance has written anything that could leave the fans out
+    /// of the firmware's hands. Set before the first write, not after the last
+    /// one succeeds, so a throw partway through still reports the truth.
+    private var hasWrittenControl = false
+
+    /// Where the baseline is remembered across processes. All of its rules —
+    /// what may be stored, when a stored file is still evidence, when to rewrite
+    /// it — live in `BaselineStore`, where they can be tested without hardware.
+    private var store: BaselineStore
+
     /// Whether `Ftst` is currently set. Tracked so the unlock delay is paid once
     /// on entering manual control rather than on every target change.
     private var isUnlocked = false
@@ -135,32 +145,140 @@ public final class FanController: @unchecked Sendable {
     /// machines. nil means not yet determined.
     private var hasUnlockKey: Bool?
 
-    public init(smc: SMCConnection) {
+    /// Where the automatic baseline is remembered across processes.
+    public static let defaultBaselineStore = BaselineStore.defaultURL
+
+    public init(smc: SMCConnection, baselineStore: URL? = FanController.defaultBaselineStore) {
         self.smc = smc
         self.fanReader = FanReader(smc: smc)
+        self.store = BaselineStore(url: baselineStore)
     }
 
     public static var isRoot: Bool { geteuid() == 0 }
+
+    /// Whether this instance may have left the fans forced or the firmware
+    /// yielded — true from the first hardware write until a restore is confirmed
+    /// clean.
+    ///
+    /// The daemon arms its supervision on this rather than on reading `Ftst`
+    /// back: that read answers false both on hardware with no such key, where
+    /// the mode write happens anyway, and when the read itself merely fails.
+    /// This flag is set by the writer, so it cannot be wrong in that direction.
+    public var mayHoldFans: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return hasWrittenControl
+    }
+
+    /// Positive evidence that the fans are out of the firmware's hands *right
+    /// now*, from any process.
+    ///
+    /// Deliberately not "a fan reads the forced mode": that value is 1, and a Mac
+    /// that legitimately rests there is indistinguishable from one being held.
+    /// Treating the mode as proof would make every restore on such a machine
+    /// report failure and latch supervision that never lets go.
+    public var fansAppearHeld: Bool {
+        if let unlock = unlockKeyValue(), unlock != 0 { return true }
+        lock.lock()
+        defer { lock.unlock() }
+        return hasWrittenControl || store.recoveredAnything
+    }
 
     /// Record each fan's resting mode so automatic control can be restored
     /// exactly. Must be called before any write; safe to call repeatedly, as it
     /// never overwrites a baseline already captured.
     @discardableResult
     public func captureBaseline() -> [Int: Double] {
-        // A mode read while the firmware is yielded is not an automatic value.
-        // `fanctl auto` runs as a fresh process that may start with the fans
-        // already forced; recording mode 1 as "automatic" there made restore a
-        // no-op and left the fans forced. Only values seen while the firmware
-        // holds the fans are trustworthy.
-        guard (unlockKeyValue() ?? 0) == 0 else { return automaticBaselineSnapshot() }
+        // A remembered baseline outranks anything observable now for the fans it
+        // covers, because it was recorded before this project touched them. It
+        // used to short-circuit the whole capture, which made the file
+        // all-or-nothing: one fan whose mode read missed at capture time was
+        // written down as absent, and every process from then on trusted that
+        // partial file and never observed the second fan again — leaving it
+        // permanently uncontrollable, since `setTarget` refuses without a
+        // baseline. So it seeds, and observation fills the gaps.
+        let recovered = loadPersistedBaseline()
+
+        // Otherwise the readings have to be *shown* to be trustworthy, not
+        // assumed to be.
+        //
+        // This used to ask only whether `Ftst` was non-zero. On the Macs that
+        // need no firmware unlock — SPEC records M1, and M5 reportedly — that key
+        // is absent or zero *even while the fans are forced*, so the guard always
+        // passed and a fresh process meeting already-forced fans recorded
+        // "forced" as the automatic baseline. Every later restore then wrote that
+        // back and did nothing. It worked on the developer's Mac purely because
+        // that machine has `Ftst`, which is exactly the shape hard rule 6 exists
+        // to catch.
+        guard !fansAreDemonstrablyForced() else { return automaticBaselineSnapshot() }
 
         lock.lock()
-        defer { lock.unlock() }
-
-        for fan in fanReader.readAll() where automaticBaseline[fan.index] == nil {
+        // Only a mode the SMC actually reported. A fabricated 0 would be cached
+        // permanently and written back on every restore, setting a mode the
+        // machine never had.
+        for fan in fanReader.readAll()
+        where automaticBaseline[fan.index] == nil && fan.modeReported {
+            // Recovering a baseline at all means this process is the successor of
+            // one that held the fans, so a fan still sitting on the forced value
+            // is forced — not resting there. Recording it would make every later
+            // restore write "forced" back over "forced" and report success.
+            if recovered, abs(fan.modeRaw - Self.forcedModeValue) < 0.001 { continue }
             automaticBaseline[fan.index] = fan.modeRaw
         }
-        return automaticBaseline
+        let captured = automaticBaseline
+        lock.unlock()
+        return captured
+    }
+
+    /// Whether there is **positive evidence** that the fans are mid-manipulation,
+    /// and their modes therefore are not an automatic baseline.
+    ///
+    /// Only `Ftst` counts as that evidence. The mode alone deliberately does not:
+    /// `forcedModeValue` is 1, and a Mac that legitimately *rests* at mode 1 is
+    /// indistinguishable from one that is forced to it. Treating "mode == 1" as
+    /// proof of manipulation would mean such a machine never captured a baseline
+    /// at all — and since `setTarget` refuses without one, fan control would be
+    /// dead on exactly the untested hardware this rule exists to protect. That is
+    /// the same shape as the bug being fixed, pointed the other way.
+    ///
+    /// What actually solves the restart-while-forced case is the persisted
+    /// baseline: if this project forced the fans, it wrote down what came before.
+    /// If something else did, no reading available now can recover it, and
+    /// guessing is worse than recording the best value we have.
+    private func fansAreDemonstrablyForced() -> Bool {
+        guard let unlock = unlockKeyValue() else { return false }
+        return unlock != 0
+    }
+
+    /// Merge any remembered baseline into this instance's.
+    ///
+    /// - Returns: true when the file supplied at least one usable value.
+    @discardableResult
+    private func loadPersistedBaseline() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        let recovered = store.load()
+        guard !recovered.isEmpty else { return false }
+        for (index, value) in recovered where automaticBaseline[index] == nil {
+            automaticBaseline[index] = value
+        }
+        return true
+    }
+
+    /// Remember the baseline before the first write, so a process that restarts
+    /// while fans are forced still knows what "automatic" was.
+    private func persistBaseline() {
+        lock.lock()
+        defer { lock.unlock() }
+        store.save(automaticBaseline)
+    }
+
+    /// Forget the remembered baseline once the fans are genuinely back under
+    /// macOS control.
+    private func clearPersistedBaseline() {
+        lock.lock()
+        defer { lock.unlock() }
+        store.clear()
     }
 
     private func automaticBaselineSnapshot() -> [Int: Double] {
@@ -231,6 +349,23 @@ public final class FanController: @unchecked Sendable {
             throw FanControlError.implausibleRange(fanIndex, fan.minRPM, fan.maxRPM)
         }
         let clamped = min(max(rpm, fan.minRPM), fan.maxRPM)
+
+        // No trustworthy baseline means no way to hand the fans back afterwards,
+        // and forcing a fan you cannot release is the one thing this project must
+        // never do. Refusing is the safe direction.
+        guard baseline(forFan: fanIndex) != nil else {
+            throw FanControlError.noBaselineRecorded(fanIndex)
+        }
+        // Written down before the first hardware write, so a crash or restart
+        // mid-session still leaves the next process able to restore.
+        persistBaseline()
+
+        // Everything below writes to the hardware, and each write can throw. The
+        // daemon reads this to decide whether a failed request still needs
+        // supervising, so it is set here rather than on the way out.
+        lock.lock()
+        hasWrittenControl = true
+        lock.unlock()
 
         try unlockIfNeeded()
 
@@ -321,6 +456,14 @@ public final class FanController: @unchecked Sendable {
             failures[-2] = "firmware had not reclaimed the fans after "
                 + "\(Int(Self.reclaimWaitSeconds))s"
         }
+        // Only once the fans are genuinely back: a remembered baseline is how the
+        // next process recovers from a failed restore, so it must outlive one.
+        if failures.isEmpty {
+            clearPersistedBaseline()
+            lock.lock()
+            hasWrittenControl = false
+            lock.unlock()
+        }
         return failures
     }
 
@@ -376,11 +519,15 @@ public final class FanController: @unchecked Sendable {
         lock.unlock()
         if known == false { return }
         if known == nil {
-            let present = (try? smc.read("Ftst")) != nil
-            lock.lock()
-            hasUnlockKey = present
-            lock.unlock()
-            if !present { return }
+            let present = probeUnlockKey()
+            // Only a definite answer is cached; "could not tell" leaves it nil so
+            // the next attempt probes again rather than inheriting one bad read.
+            if let present {
+                lock.lock()
+                hasUnlockKey = present
+                lock.unlock()
+                if !present { return }
+            }
         }
 
         do {
@@ -450,12 +597,23 @@ public final class FanController: @unchecked Sendable {
         guard shouldWrite else { return nil }
         guard Self.isRoot else { return FanControlError.notRoot.description }
 
-        // Nothing to clear on hardware that has no unlock key.
+        // Nothing to clear on hardware that has no unlock key — but "we could
+        // not find out" is not the same answer, and must not be reported as
+        // success. Returning nil here means "Ftst is confirmed clear"; saying
+        // that without having checked is how a yielded firmware got recorded as
+        // a completed restore.
         lock.lock()
-        let keyAvailable = hasUnlockKey ?? ((try? smc.read("Ftst")) != nil)
-        hasUnlockKey = keyAvailable
+        let cached = hasUnlockKey
         lock.unlock()
-        guard keyAvailable else { return nil }
+        let availability = cached ?? probeUnlockKey()
+        if let availability {
+            lock.lock()
+            hasUnlockKey = availability
+            lock.unlock()
+            if !availability { return nil }
+        } else {
+            return "could not determine whether this Mac has the Ftst unlock key"
+        }
 
         // The firmware does not always reflect the write immediately, so confirm
         // rather than assume, and retry before giving up.
@@ -470,6 +628,26 @@ public final class FanController: @unchecked Sendable {
             if let value = (try? smc.read("Ftst"))?.number, value == 0 { return nil }
         }
         return lastError ?? "Ftst still reads non-zero after 5 attempts"
+    }
+
+    /// Whether this Mac has the unlock key: true, false, or nil for "could not
+    /// tell".
+    ///
+    /// `(try? read) != nil` conflates a key that does not exist with a read that
+    /// failed, and the answer used to be cached permanently either way. A single
+    /// transient failure therefore latched the process into "no unlock key",
+    /// after which `relock` returned nil — which its own documentation defines as
+    /// "Ftst confirmed clear" — without ever writing it. Only `keyNotFound` is
+    /// evidence of absence.
+    private func probeUnlockKey() -> Bool? {
+        do {
+            _ = try smc.read("Ftst")
+            return true
+        } catch SMCError.keyNotFound {
+            return false
+        } catch {
+            return nil
+        }
     }
 
     /// Current value of the firmware unlock key.

@@ -24,6 +24,14 @@ public struct Fan: Identifiable, Equatable, Sendable {
     /// whose limits are unknown is reported, but never driven.
     public let limitsReported: Bool
 
+    /// Whether the SMC actually reported this fan's mode.
+    ///
+    /// `?? 0` made an unreadable mode indistinguishable from a genuine 0, and
+    /// that value was then cached as the automatic baseline and written back on
+    /// every restore — restoring a mode the machine never had. Same reasoning as
+    /// `limitsReported`.
+    public let modeReported: Bool
+
     /// Raw value of `F{i}Md`.
     ///
     /// Mode semantics are not the documented 0 = auto / 1 = forced on Apple
@@ -43,7 +51,8 @@ public struct Fan: Identifiable, Equatable, Sendable {
         maxRPM: Double,
         targetRPM: Double,
         modeRaw: Double,
-        limitsReported: Bool = true
+        limitsReported: Bool = true,
+        modeReported: Bool = true
     ) {
         self.index = index
         self.actualRPM = actualRPM
@@ -52,6 +61,7 @@ public struct Fan: Identifiable, Equatable, Sendable {
         self.targetRPM = targetRPM
         self.modeRaw = modeRaw
         self.limitsReported = limitsReported
+        self.modeReported = modeReported
     }
 
     /// Where `rpm` sits in this fan's range, 0...1. Presets are stored as
@@ -126,7 +136,8 @@ public struct FanReader: Sendable {
         let maxRPM = reportedMax ?? 0
         let target = smc.readNumber("F\(index)Tg") ?? actual
         // Mode is spelled lowercase on some hardware; try both before giving up.
-        let mode = smc.readNumber("F\(index)Md") ?? smc.readNumber("F\(index)md") ?? 0
+        let reportedMode = smc.readNumber("F\(index)Md") ?? smc.readNumber("F\(index)md")
+        let mode = reportedMode ?? 0
 
         return Fan(
             index: index,
@@ -135,7 +146,8 @@ public struct FanReader: Sendable {
             maxRPM: maxRPM,
             targetRPM: target,
             modeRaw: mode,
-            limitsReported: reportedMin != nil && reportedMax != nil
+            limitsReported: reportedMin != nil && reportedMax != nil,
+            modeReported: reportedMode != nil
         )
     }
 

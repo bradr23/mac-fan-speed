@@ -157,8 +157,33 @@ struct DropdownView: View {
                 helperBanner
 
                 if monitor.helper.status.isReady {
-                    presetButtons
-                    speedSlider
+                    if monitor.hasControllableFans || monitor.fansEverControllable {
+                        presetButtons
+                        speedSlider
+                    } else {
+                        // Offering a slider and mode buttons that the daemon will
+                        // refuse is worse than offering nothing: the controls
+                        // moved, the fans did not, and the only clue was an error.
+                        Label("This Mac's fans cannot be controlled",
+                              systemImage: "exclamationmark.triangle")
+                            .font(.caption.weight(.medium))
+                            .foregroundStyle(.orange)
+                        Text("The SMC does not report their speed limits, so there is no "
+                             + "safe range to hold them in. Monitoring works normally.")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+
+                        // The Auto button lives in `presetButtons`, and it is the
+                        // only `setMode(.auto)` in the app. Hiding this branch's
+                        // controls without it left a Mac that had somehow reached
+                        // Manual — a stored startup mode, say — with no route out.
+                        if monitor.mode != .auto {
+                            modeButton(title: "Return fans to macOS", isSelected: false) {
+                                monitor.setMode(.auto)
+                            }
+                        }
+                    }
                 }
 
                 if let message = monitor.failsafeMessage {

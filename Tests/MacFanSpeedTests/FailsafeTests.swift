@@ -48,14 +48,55 @@ final class FailsafeTests: XCTestCase {
 
     func testLostSensorsTripTheFailsafe() {
         // Holding a manual fan speed with no idea how hot the machine is would be
-        // worse than handing control back.
+        // worse than handing control back — but only once the readings are
+        // genuinely gone, not on the first hiccup.
         var failsafe = Failsafe()
+        for _ in 0..<(Failsafe.missesBeforeSensorsLost - 1) {
+            XCTAssertEqual(failsafe.evaluate(input(cpu: nil)), .noChange)
+        }
         XCTAssertEqual(failsafe.evaluate(input(cpu: nil)), .trip(.temperatureUnavailable))
+    }
+
+    /// The sensor reader returns nothing if its service copy fails once, which
+    /// happens on any Mac. Tripping on that handed the fans back for a glitch,
+    /// and on a warm machine the release then needed a reading below the reset
+    /// point — so a momentary miss could hold the app in Auto far longer than the
+    /// miss itself lasted.
+    func testASingleMissedReadingIsTolerated() {
+        var failsafe = Failsafe()
+        XCTAssertEqual(failsafe.evaluate(input(cpu: nil)), .noChange)
+        XCTAssertFalse(failsafe.isTripped)
+        // A good reading clears the count, so misses must be consecutive.
+        XCTAssertEqual(failsafe.evaluate(input(cpu: 45)), .noChange)
+        XCTAssertEqual(failsafe.evaluate(input(cpu: nil)), .noChange)
+        XCTAssertFalse(failsafe.isTripped)
     }
 
     func testNonFiniteReadingCountsAsLost() {
         var failsafe = Failsafe()
+        for _ in 0..<(Failsafe.missesBeforeSensorsLost - 1) {
+            XCTAssertEqual(failsafe.evaluate(input(cpu: .nan)), .noChange)
+        }
         XCTAssertEqual(failsafe.evaluate(input(cpu: .nan)), .trip(.temperatureUnavailable))
+    }
+
+    /// Dwell is time spent hot *under this app's control*. Accumulating it while
+    /// macOS owned the fans handed a freshly-enabled manual mode a timer that had
+    /// already expired, so it tripped on its first tick for heat that predated it.
+    func testDwellDoesNotAccumulateWhileMacOSOwnsTheFans() {
+        var failsafe = Failsafe()
+        let start = Date(timeIntervalSince1970: 1_000_000)
+        // Hot, but in Auto — this time must not count.
+        for minute in 0...10 {
+            _ = failsafe.evaluate(
+                input(cpu: 88, now: start.addingTimeInterval(Double(minute) * 60), manual: false)
+            )
+        }
+        let handover = start.addingTimeInterval(11 * 60)
+        XCTAssertEqual(
+            failsafe.evaluate(input(cpu: 88, now: handover)), .noChange,
+            "entering manual must not inherit an expired dwell timer"
+        )
     }
 
     func testDoesNotTripWhenFansAreAlreadyAutomatic() {
@@ -233,6 +274,39 @@ final class FailsafeTests: XCTestCase {
         XCTAssertEqual(failsafe.tripCelsius, 95)
         XCTAssertEqual(failsafe.resetCelsius, 85)
         XCTAssertLessThan(failsafe.resetCelsius, failsafe.tripCelsius)
+    }
+
+    // MARK: The miss counter belongs to one manual session
+
+    /// Misses are consecutive ticks *while manual control is held*. Carried
+    /// across a spell in Auto, two at the end of one session plus one at the
+    /// start of the next tripped on the first tick — so a fresh session never
+    /// got the tolerance the constant advertises. The trip is in the safe
+    /// direction, but it also blocks re-entry to manual until the machine cools
+    /// below the reset point, which on a warm Mac outlasts the glitch by a lot.
+    func testMissesDoNotCarryAcrossASpellInAutomatic() {
+        var failsafe = Failsafe()
+        XCTAssertEqual(failsafe.evaluate(input(cpu: nil)), .noChange)
+        XCTAssertEqual(failsafe.evaluate(input(cpu: nil)), .noChange)
+
+        // Back under macOS control for a while.
+        for _ in 0..<10 {
+            XCTAssertEqual(failsafe.evaluate(input(cpu: 42, manual: false)), .noChange)
+        }
+
+        // One glitch in the new session must not be decisive.
+        XCTAssertEqual(failsafe.evaluate(input(cpu: nil)), .noChange)
+        XCTAssertFalse(failsafe.isTripped)
+    }
+
+    /// The tolerance itself still holds within a session.
+    func testConsecutiveMissesWithinOneSessionStillTrip() {
+        var failsafe = Failsafe()
+        XCTAssertEqual(failsafe.evaluate(input(cpu: nil)), .noChange)
+        XCTAssertEqual(failsafe.evaluate(input(cpu: nil)), .noChange)
+        XCTAssertEqual(
+            failsafe.evaluate(input(cpu: nil)), .trip(.temperatureUnavailable)
+        )
     }
 }
 

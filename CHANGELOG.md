@@ -2,6 +2,145 @@
 
 Notable changes in each release. Versions follow [semantic versioning](https://semver.org).
 
+## 0.5.0
+
+Full audit of 0.4.1 — eight lenses over the whole codebase, every significant
+finding put through an adversarial pass that defaulted to refuting it. Four high
+and thirteen medium findings, all fixed here.
+
+The fixes were then reviewed the same way, which found fourteen defects *in the
+fixes* — four of them more serious than the finding being fixed. Those are fixed
+too, and the ones that changed the shape of a fix are described below.
+
+### Fixed
+
+- **Three routes could leave the fans forced while the daemon believed it owned
+  nothing.** Every restore path — the watchdog, client disconnect, sleep,
+  `SIGTERM`, the daemon's own failsafe — is gated on one flag, so any route that
+  leaves the hardware forced while that flag reads false disarms all of them at
+  once, silently.
+
+  `setAllAuto` cancelled the watchdog, stopped the thermal watch and cleared the
+  flag *before* checking whether the restore had worked; it now delegates to the
+  one implementation that gets that right. A throw partway through `setTarget`
+  returned an error and armed nothing, leaving thermal management yielded and
+  possibly a fan pinned; ownership now begins at the first hardware write rather
+  than at success, published by the writer as `mayHoldFans`. And because that
+  flag is per-process while the hardware is not, `setAllAuto` now attempts a real
+  restore even when this daemon has no record of forcing anything — which is
+  exactly the state a replaced, kickstarted or crashed daemon starts in, and
+  where every client-facing release used to return success for doing nothing.
+
+- **Restore was a silent no-op on Macs that need no firmware unlock.**
+  `captureBaseline` decided a mode reading was untrustworthy only when `Ftst` was
+  non-zero. On hardware that does not need the unlock — SPEC records M1, and M5
+  reportedly — that key is absent or zero *even while the fans are forced*, so a
+  fresh process meeting already-forced fans recorded "forced" as the automatic
+  baseline and every later restore wrote it back. It worked on the developer's
+  M4 Pro purely because that machine has `Ftst`.
+
+  The baseline is now written to `/var/db` before the first hardware write, so a
+  process that restarts while fans are forced still knows what "automatic" was,
+  and `setTarget` refuses outright without one. Persistence has its own hazards,
+  and the review found all of them: the store refuses to record the forced value
+  (persisting one turns a transient mis-read into a permanent, unclearable one),
+  it carries a `kern.boottime` stamp so a file from an earlier boot cannot
+  outrank the live modes, it merges with observation instead of short-circuiting
+  it — a partial file used to leave a second fan permanently uncontrollable —
+  and it rewrites only on change instead of once per fan per two-second
+  heartbeat.
+
+- **One failed `Ftst` read was cached as "this Mac has no unlock key".**
+  `(try? read) != nil` cannot distinguish a missing key from a read that failed,
+  and the answer was cached permanently: one transient failure made `relock`
+  return "confirmed clear" without ever writing the key. Only
+  `SMCError.keyNotFound` is now evidence of absence, and an undetermined answer
+  is reported as an error rather than as success.
+
+- **A single transient sensor read failure handed the fans back.** The HID
+  reader returns empty if its service copy fails once, which happens on any Mac.
+  Both the app's failsafe and the daemon's watch now tolerate two misses and act
+  on the third. On a warm machine this matters more than it sounds: the release
+  needs a reading below the reset point, so a momentary glitch could hold the app
+  in Auto far longer than the glitch. The miss counter belongs to one manual
+  session and is cleared on leaving it.
+
+- **The daemon's thermal watch could stop and never restart.** It was gated on
+  `TemperatureReader.isAvailable`, which only reports that a HID client object
+  exists, while the trip used an actual reading — the two tested different
+  things. The watch is now gated on sensing having been proven, a slow recovery
+  tick re-arms it as soon as readings return rather than waiting for a client to
+  ask for something, and the 95 °C ceiling refuses a request on the strength of
+  the reading alone: a reading is evidence of itself, and requiring sensing to be
+  "proven" first opened a window in which a genuinely hot machine's fans were
+  taken over for the whole twelve-second unlock retry.
+
+- **A queued fan request could re-force the fans immediately after the sleep
+  restore.** The app re-sends its target every two seconds and does not know
+  sleep is happening. The daemon now refuses requests from the moment it starts
+  the sleep restore until it wakes — with a timeout, because a gate that only a
+  wake message can lift is a gate that refuses everything forever if that message
+  never arrives, which is this project's most repeated bug shape.
+
+- **An unreadable `F{i}Md` fabricated an automatic baseline of 0.** `?? 0` made a
+  failed read indistinguishable from a genuine zero, and that value was cached
+  and written back on every restore — setting a mode the machine never had. Fans
+  now report whether their mode was actually read, and only reported modes become
+  a baseline.
+
+- **The dwell timer accumulated while macOS owned the fans**, so a machine that
+  had been warm on its own handed a freshly-enabled manual mode a timer that was
+  already expired, and it tripped on its first tick — blaming the user's setting
+  for heat that predated it.
+
+- **The dropdown kept showing a live curve readout after the app had dropped to
+  Auto**, and editing the active preset in Settings never reached the fans. Both
+  are fixed; the edit hook takes the edited preset's id, because wiring it to
+  every row while resolving the *active* preset meant tuning one profile
+  overwrote the running profile's speed and reset its filter, hysteresis and slew
+  state on every drag tick.
+
+- **The slider and preset buttons were live but inert on a Mac whose fans report
+  no limits.** The daemon refuses every target there, so the controls moved and
+  the fans did not. That state now explains itself instead — and keeps a route
+  back to Auto, since the Auto button was the only `setMode(.auto)` in the app;
+  manual control is refused up front rather than entered and then discovered to
+  be useless. One transient limits read no longer swaps the whole section for a
+  permanent-sounding warning.
+
+- **`scripts/verify-safety.sh` could report the failure it exists to catch as a
+  pass.** It hardcoded fan mode 3 as "automatic", which fails on any Mac that
+  rests at a different value, and it recorded the resting mode without first
+  making sure the fans were at rest — read while a copy of the app was still
+  holding Manual, both release checks compared forced against forced and printed
+  PASS. It now hands the fans back, waits, records what the machine actually
+  rests at, and refuses to run if it cannot read it. Its cleanup also checks that
+  the rebuild it performs succeeded, so a below-idle test ceiling cannot survive
+  in the installable payload.
+
+- **SPEC corrections.** It classified the garbage `PMU tdev` family as a CPU tier
+  the failsafe reads, when the code excludes it by name before classification
+  runs; it documented a menu bar warning state on failsafe trip that does not
+  exist; and a daemon doc comment stated the opposite of the code directly
+  beneath it.
+
+### Changed
+
+- **The daemon's decision-making moved into value types that can actually be
+  tested.** The executable target is in no test bundle, so logic left inside it
+  was untestable — and the regression tests written for the 0.4.0 lockout
+  asserted against a *transcription* of that logic into the test file, which
+  would have stayed green through any regression in the real thing. That is worse
+  than no test, because it reads as coverage.
+
+  `ThermalWatchState` (the whole thermal state machine), `StalenessJudge` (the
+  sleep-versus-wedge decision from 0.4.1, which had no test at all) and
+  `BaselineStore` (the persistence rules that decide whether forced fans can ever
+  be handed back) are now plain types in `SMCKit` and the app, with 41 tests
+  between them. The transcription-based suite was deleted rather than kept
+  beside them. Every new test was mutation-checked: reverting the behaviour it
+  describes makes it fail.
+
 ## 0.4.1
 
 ### Fixed

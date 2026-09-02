@@ -199,43 +199,36 @@ final class FanMonitor: ObservableObject {
     /// Hand the fans back if snapshots have stopped arriving *while the app was
     /// running*.
     ///
-    /// The distinction matters. This check exists for a poll queue that has
-    /// wedged while the app carries on — a real failure mode where the UI keeps
-    /// showing its last comfortable reading. But a suspended process resumes with
-    /// an equally old timestamp for an entirely innocent reason, and the first
-    /// version could not tell the two apart: every sleep looked like a wedged
-    /// loop, so the app dropped to Auto on waking and, because this bypassed
-    /// `Failsafe` entirely, nothing ever put it back.
-    ///
-    /// A wedged queue is caught within a couple of polls, because `poll()` keeps
-    /// running and its own clock stays current. A suspension shows up as a gap in
-    /// `poll()` *as well*, and that is the signature used here.
+    /// The judgement itself lives in `StalenessJudge` so it can be tested; this
+    /// only acts on the verdict.
     private func checkForStaleReadings() {
-        guard mode == .manual, let lastSnapshot = lastSnapshotAt else { return }
-        let now = Date()
-
-        // The whole process was away: not a wedge, and not this check's business.
-        if let lastPoll = lastPollAt,
-           now.timeIntervalSince(lastPoll) > Self.pollInterval * 3 {
-            lastSnapshotAt = now
+        guard mode == .manual else { return }
+        let judge = StalenessJudge(
+            pollInterval: Self.pollInterval, staleAfter: Failsafe.staleReadingSeconds
+        )
+        switch judge.judge(now: Date(), lastSnapshot: lastSnapshotAt, lastPoll: lastPollAt) {
+        case .fine:
             return
-        }
 
-        let age = now.timeIntervalSince(lastSnapshot)
-        guard age > Failsafe.staleReadingSeconds else { return }
+        case .wasSuspended:
+            // The whole process was away. Re-base the clock so the innocent gap
+            // is not read as a stall on the next tick either.
+            lastSnapshotAt = Date()
 
-        // Routed through the failsafe rather than setting `mode` directly, so
-        // that the trip is *recorded* and its release path can fire when
-        // snapshots resume. Setting the mode here on its own was a one-way door:
-        // `Failsafe` never knew it had tripped, so it never issued the `.release`
-        // that would have restored manual control, and only a click could.
-        var input = FailsafeInput(cpuCelsius: cpu?.celsius, manualControlActive: true)
-        input.readingAge = age
-        input.now = now
-        if case .trip(let reason) = failsafe.evaluate(input) {
-            mode = .auto
-            failsafeMessage = reason.message
-            releaseToAutomatic(reason: "stale readings")
+        case .stalled(let age):
+            // Routed through the failsafe rather than setting `mode` directly, so
+            // that the trip is *recorded* and its release path can fire when
+            // snapshots resume. Setting the mode here on its own was a one-way
+            // door: `Failsafe` never knew it had tripped, so it never issued the
+            // `.release` that would have restored manual control.
+            var input = FailsafeInput(cpuCelsius: cpu?.celsius, manualControlActive: true)
+            input.readingAge = age
+            input.now = Date()
+            if case .trip(let reason) = failsafe.evaluate(input) {
+                enterAutomatic()
+                failsafeMessage = reason.message
+                releaseToAutomatic(reason: "stale readings")
+            }
         }
     }
 
@@ -254,6 +247,7 @@ final class FanMonitor: ObservableObject {
 
     private func apply(_ snapshot: SystemSnapshot) {
         fans = snapshot.fans
+        if !controllableFans.isEmpty { fansEverControllable = true }
         cpu = snapshot.cpuTemperature
         allSensors = snapshot.sensors
         lastSnapshotAt = Date()
@@ -396,6 +390,18 @@ final class FanMonitor: ObservableObject {
         speedDriver = curveController.driver
     }
 
+    /// Leave manual control, clearing everything that describes it.
+    ///
+    /// The dropdown kept showing a live speed readout and a "raised from…"
+    /// caption after the app had dropped to Auto, so it described a control loop
+    /// that was no longer running.
+    private func enterAutomatic() {
+        mode = .auto
+        speedDriver = .user
+        commandedPercent = 0
+        lastAppliedCurve = nil
+    }
+
     func setMode(_ newMode: ControlMode) {
         lastControlError = nil
 
@@ -412,13 +418,22 @@ final class FanMonitor: ObservableObject {
                 lastControlError = "Install the fan control helper in Settings first."
                 return
             }
+            // A Mac whose fans never report their limits has no safe range to
+            // hold them in, so the daemon refuses every target. Entering manual
+            // there produced a mode with no effect and — because the dropdown
+            // hides the controls in that state — no way back out.
+            guard hasControllableFans else {
+                lastControlError = "This Mac's fans do not report a controllable range."
+                settings.startupMode = .auto
+                return
+            }
             mode = .manual
             settings.startupMode = activePresetID == nil ? .manual : .preset
             beginControl()
             sendTargets()
 
         case .auto:
-            mode = .auto
+            enterAutomatic()
             activePresetID = nil
             failsafeMessage = nil
             settings.startupMode = .auto
@@ -446,6 +461,28 @@ final class FanMonitor: ObservableObject {
             activePresetID = previousPreset
             settings.selectedPresetID = previousPreset
         }
+    }
+
+    /// Re-read a preset that was just edited and re-apply it if it is the one
+    /// running.
+    ///
+    /// Editing a preset in Settings mutated the stored profile but nothing told
+    /// the control loop, so changing the speed of the profile that was *currently
+    /// running* did nothing until it was reselected.
+    ///
+    /// The edited preset's id is required. Without it this resolved whatever
+    /// `activePresetID` pointed at, and the Settings rows that call it are inside
+    /// a `ForEach` over *every* preset — so tuning "Turbo" while "Quiet" was in
+    /// force overwrote the speed from Quiet, reset Quiet's median filter,
+    /// hysteresis reference and slew limiter, and re-commanded it immediately on
+    /// every drag tick.
+    func activePresetChanged(_ editedID: UUID) {
+        guard mode == .manual, let id = activePresetID, id == editedID,
+              let preset = presets.preset(id: id)
+        else { return }
+        if preset.curve == nil { settings.manualPercent = preset.percent }
+        beginControl()
+        sendTargets()
     }
 
     func apply(preset: FanPreset) {
@@ -581,7 +618,7 @@ final class FanMonitor: ObservableObject {
             // Give the fans back immediately, then report why. The stored startup
             // mode is deliberately left alone — the user's preference has not
             // changed, only the current safety state.
-            mode = .auto
+            enterAutomatic()
             failsafeMessage = reason.message
             releaseToAutomatic(reason: "failsafe")
 
@@ -613,6 +650,16 @@ final class FanMonitor: ObservableObject {
     /// SMC never reported is shown and monitored, but never driven.
     var controllableFans: [Fan] { fans.filter(\.limitsReported) }
     var hasControllableFans: Bool { !controllableFans.isEmpty }
+
+    /// True once any fan has reported its limits in this session.
+    ///
+    /// `limitsReported` is recomputed from a live SMC read on every poll, so a
+    /// single transient failure of the min/max read — the same class of hiccup
+    /// the failsafe's miss tolerance exists for — otherwise swapped the whole
+    /// control section for a permanent-sounding "this Mac's fans cannot be
+    /// controlled". The verdict only becomes visible if it has never once been
+    /// contradicted.
+    private(set) var fansEverControllable = false
 
     var averageRPM: Double? {
         guard !fans.isEmpty else { return nil }

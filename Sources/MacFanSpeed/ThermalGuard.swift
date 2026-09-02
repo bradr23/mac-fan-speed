@@ -43,9 +43,16 @@ enum ThermalGuard {
 
     /// Minimum speed this temperature demands, as a fraction of each fan's range.
     ///
-    /// An unknown temperature asks for everything. That state lasts at most one
-    /// poll — the failsafe trips on unreadable sensors on the same tick — and
-    /// running the fans hard for two seconds is the cheap side of the trade.
+    /// An unknown temperature asks for everything: with nothing to judge by, the
+    /// only safe direction is more cooling.
+    ///
+    /// The window is bounded by `Failsafe.missesBeforeSensorsLost`, not by a
+    /// single poll. The failsafe tolerates two misses before handing the fans
+    /// back, because `TemperatureReader` returns empty whenever the HID service
+    /// copy fails once and tripping on that hiccup was worse. So this can hold
+    /// for up to three polls — six seconds — and at `slewUpPerSecond` the command
+    /// does reach full range inside it. Audible, and deliberately preferred to
+    /// guessing a temperature.
     static func percent(atCelsius celsius: Double?) -> Double {
         guard let celsius, celsius.isFinite else { return 1 }
         return floor.percent(atCelsius: celsius)
