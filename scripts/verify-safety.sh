@@ -28,6 +28,16 @@ APP="$ROOT/build/MacFanSpeed.app/Contents/MacOS/MacFanSpeed"
 FAILSAFE_SRC="Sources/SMCKit/ThermalLimits.swift"
 PASS=0; FAIL=0; SKIP=0
 
+# Build logs go somewhere this run owns. A fixed /tmp path is shared with every
+# other user on the machine: an earlier run under sudo left a root-owned
+# /tmp/mfs-verify-rebuild.log, and the next run as the developer could not open
+# it — so the redirection failed, bash never ran the command, and the restoring
+# rebuild silently did not happen. It was reported as a build failure, which is a
+# different thing and needed a different fix.
+LOGDIR="$(mktemp -d "${TMPDIR:-/tmp}/mfs-verify.XXXXXX")" || {
+    echo "could not create a temporary directory for build logs" >&2; exit 1
+}
+
 green() { printf '\033[32m%s\033[0m\n' "$1"; }
 red()   { printf '\033[31m%s\033[0m\n' "$1"; }
 amber() { printf '\033[33m%s\033[0m\n' "$1"; }
@@ -172,8 +182,9 @@ cleanup() {
         # below-idle ceiling compiled into build/FanHelper and into the helper
         # payload inside MacFanSpeed.app — which is exactly what Install Helper
         # would then have put on the machine as root.
+        local log="$LOGDIR/rebuild.log"
         local built=0
-        ./scripts/build.sh release >/tmp/mfs-verify-rebuild.log 2>&1 || built=$?
+        ./scripts/build.sh release >"$log" 2>&1 || built=$?
 
         local source_ok=1
         grep -q "assumedCriticalCelsius: Double = 100" "$FAILSAFE_SRC" || source_ok=0
@@ -183,13 +194,18 @@ cleanup() {
         else
             red "THE TEST THRESHOLD MAY STILL BE IN YOUR BUILD."
             [ "$source_ok" -eq 1 ] || red "  source: $FAILSAFE_SRC is not restored"
-            [ "$built" -eq 0 ] || red "  rebuild FAILED (see /tmp/mfs-verify-rebuild.log)"
+            if [ "$built" -ne 0 ]; then
+                red "  rebuild FAILED:"
+                tail -20 "$log" 2>/dev/null | sed 's/^/    /'
+            fi
             red "  Fix with:  git checkout $FAILSAFE_SRC && ./scripts/build.sh release"
             red "  Do not install the helper from this build until you have."
         fi
     fi
 
     # Last word on hard rule 2: say plainly whether the fans came back.
+    # (The log directory is removed after this, so a failure above can still be
+    # read from it while it is being reported.)
     if [ "$FANLESS" -eq 0 ] && [ -n "$BASELINE_MODES" ]; then
         if wait_until_automatic 20; then
             green "Fans are back under macOS control ($(fan_modes))."
@@ -198,6 +214,8 @@ cleanup() {
             red "  Recover with:  ./build/fanctl helper-auto"
         fi
     fi
+
+    rm -rf "$LOGDIR"
 }
 # Only EXIT does the work; the signal traps just choose an exit code. The trap
 # used to fire cleanup for INT and again for EXIT, running the whole rebuild
@@ -341,8 +359,9 @@ grep -q "assumedCriticalCelsius: Double = ${CRITICAL}" "$FAILSAFE_SRC" \
 # Checked, not assumed. A failed build here left the *previous* binary in place —
 # still carrying the real 95 °C ceiling — and the script then reported "failsafe
 # did not fire" as a product failure.
-if ! ./scripts/build.sh release >/tmp/mfs-verify-build.log 2>&1; then
-    bad "the patched build FAILED (see /tmp/mfs-verify-build.log)"
+if ! ./scripts/build.sh release >"$LOGDIR/patched.log" 2>&1; then
+    bad "the patched build FAILED:"
+    tail -20 "$LOGDIR/patched.log" 2>/dev/null | sed 's/^/    /'
     exit 1
 fi
 

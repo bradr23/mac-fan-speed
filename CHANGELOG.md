@@ -236,6 +236,13 @@ worse than no gate.
   reports a fanless Mac — an explicitly supported configuration — as skipped
   rather than failed.
 
+  Its build logs go to a `mktemp` directory rather than a fixed path in `/tmp`.
+  A run under sudo left a root-owned log there, and the next run as the developer
+  could not open it — so the redirection failed, the restoring rebuild never ran,
+  and the failure was reported as a build error, which needed a different fix. A
+  shared, predictable path in a world-writable directory is a bad place for a
+  file whose absence changes what the script concludes.
+
 - **Two regression tests were vacuous.** `testResetIsAlwaysBelowTrip` and
   `testEverySettableCutoffIsAtOrBelowTheDaemonCeiling` walk a `stride` over a
   derived range. A positive stride whose upper bound is below its lower bound
