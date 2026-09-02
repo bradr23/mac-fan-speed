@@ -46,12 +46,21 @@ final class DaemonHardeningTests: XCTestCase {
     /// The app's cutoff can only ever be lower, so in normal use the app trips
     /// first and the daemon's limit is never reached.
     func testEverySettableCutoffIsAtOrBelowTheDaemonCeiling() {
+        // Non-emptiness asserted first: a stride whose upper bound is below its
+        // lower bound walks nothing, and a loop that never runs asserts nothing.
+        XCTAssertGreaterThan(
+            ThermalLimits.maximumTripCelsius, ThermalLimits.minimumTripCelsius
+        )
+
+        var checked = 0
         for value in stride(from: ThermalLimits.minimumTripCelsius,
                             through: ThermalLimits.maximumTripCelsius, by: 1) {
             XCTAssertLessThanOrEqual(
                 ThermalLimits.clampTrip(value), ThermalLimits.daemonTripCelsius
             )
+            checked += 1
         }
+        XCTAssertGreaterThan(checked, 1, "the settable range walked no values")
     }
 
     func testCutoffCannotBeRaisedPastTheCeiling() {

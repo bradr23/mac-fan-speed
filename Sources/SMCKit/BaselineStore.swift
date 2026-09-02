@@ -56,13 +56,29 @@ public struct BaselineStore {
 
     /// Entries worth remembering.
     ///
-    /// A value equal to `forcedModeValue` is dropped rather than stored. It can
-    /// only come from a capture that read a fan mid-manipulation, and keeping one
+    /// Two values are dropped rather than stored, both because they can only come
+    /// from a capture that read a fan mid-transition, and because keeping one
     /// turns a transient mis-read into a permanent one: the file outranks live
-    /// observation, and a restore that writes "forced" back over "forced" never
-    /// succeeds, so nothing ever deletes the file that caused it.
+    /// observation, and a restore that writes the wrong mode never succeeds, so
+    /// nothing ever deletes the file that caused it.
+    ///
+    /// - `forcedModeValue` — a fan being held, not resting.
+    /// - `midHandshakeModeValue` — the value the mode passes through while the
+    ///   firmware takes the fans back. The daemon's own comment records a
+    ///   previous run writing exactly this down as "automatic", and hard rule 3
+    ///   forbids writing 0 back as a restore.
+    ///
+    /// This is deliberately narrower than it looks. It filters what is *written
+    /// down for the next process*, never what this one captured: a machine that
+    /// genuinely rests at either value still restores correctly from its
+    /// in-memory baseline. All it gives up is crash recovery on such hardware,
+    /// where clearing `Ftst` is the release mechanism anyway.
     static func usableEntries(_ fans: [Int: Double]) -> [Int: Double] {
-        fans.filter { $0.value.isFinite && abs($0.value - FanController.forcedModeValue) >= 0.001 }
+        fans.filter { entry in
+            entry.value.isFinite
+                && abs(entry.value - FanController.forcedModeValue) >= 0.001
+                && abs(entry.value - FanController.midHandshakeModeValue) >= 0.001
+        }
     }
 
     /// Whether the file supplied anything usable this run.

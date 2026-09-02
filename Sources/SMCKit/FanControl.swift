@@ -95,6 +95,16 @@ public final class FanController: @unchecked Sendable {
     /// every write is verified afterwards rather than assumed to have worked.
     public static let forcedModeValue: Double = 1
 
+    /// The value `F{i}Md` passes through while the firmware is taking the fans
+    /// back. SPEC records the mode dropping 3 -> 0 -> 3 during that handshake, so
+    /// a 0 read at the wrong moment is a transition, not a resting state — and
+    /// hard rule 3 forbids writing 0 back as a "restore".
+    ///
+    /// Named rather than written as a literal because two separate places have to
+    /// agree on it: the reclaim wait, which must not mistake it for a completed
+    /// handover, and the baseline store, which must never record it.
+    public static let midHandshakeModeValue: Double = 0
+
     /// How long to keep retrying the mode write after setting `Ftst`.
     ///
     /// The firmware does not yield at a fixed moment — `thermalmonitord` releases
@@ -103,11 +113,6 @@ public final class FanController: @unchecked Sendable {
     /// the unlock work.
     public static let unlockRetryWindow: TimeInterval = 12
     public static let unlockRetryInterval: TimeInterval = 0.25
-
-    /// Restore runs when the firmware is already unlocked, so the write should
-    /// land immediately. A shorter window keeps total recovery well inside the
-    /// time a crashed app must be caught in, even with several fans.
-    public static let restoreRetryWindow: TimeInterval = 4
 
     /// How long to wait for a written target to be reflected back.
     public static let targetVerifyWindow: TimeInterval = 2
@@ -397,17 +402,6 @@ public final class FanController: @unchecked Sendable {
         )
     }
 
-    /// Hand a fan back to macOS by restoring the mode it had before we wrote.
-    public func restoreAutomatic(fanIndex: Int) throws {
-        guard Self.isRoot else { throw FanControlError.notRoot }
-
-        guard let baseline = baseline(forFan: fanIndex) else {
-            throw FanControlError.noBaselineRecorded(fanIndex)
-        }
-        try unlockIfNeeded()
-        try writeModeWithRetry(fanIndex: fanIndex, value: baseline)
-    }
-
     /// Restore every fan. Errors are collected rather than thrown, so one failing
     /// fan cannot prevent the others from being released — this runs on exit
     /// paths where giving up partway would leave fans forced.
@@ -467,21 +461,46 @@ public final class FanController: @unchecked Sendable {
         return failures
     }
 
-    /// Poll until no fan is still sitting on the forced mode value.
+    /// Poll until every fan is genuinely back under the firmware's control.
     /// - Returns: true once the firmware has taken the fans back.
     @discardableResult
     public func waitForFirmwareToReclaim() -> Bool {
         let deadline = Date().addingTimeInterval(Self.reclaimWaitSeconds)
         while Date() < deadline {
-            let stillForced = fanReader.readAll().contains {
-                abs($0.modeRaw - Self.forcedModeValue) < 0.001
-            }
-            if !stillForced { return true }
+            if fanReader.readAll().allSatisfy(hasReclaimed) { return true }
             Thread.sleep(forTimeInterval: 0.5)
         }
-        return !fanReader.readAll().contains {
-            abs($0.modeRaw - Self.forcedModeValue) < 0.001
+        return fanReader.readAll().allSatisfy(hasReclaimed)
+    }
+
+    /// Whether one fan is back where it started.
+    ///
+    /// This used to be "the mode is not `forcedModeValue`", which is wrong in
+    /// both directions. It accepts `midHandshakeModeValue` — the value the mode
+    /// passes *through* on its way back — so a poll landing mid-handshake was
+    /// reported as a completed reclaim, and the restore went on to delete the
+    /// crash-recovery file and disarm ownership on the strength of a transient
+    /// reading. And on a Mac whose resting mode is itself the forced value it can
+    /// never be satisfied, so every restore burned the full ten seconds and
+    /// reported failure.
+    ///
+    /// The captured baseline is the only exact answer, so it is used wherever one
+    /// exists.
+    private func hasReclaimed(_ fan: Fan) -> Bool {
+        guard fan.modeReported else { return false }
+
+        if let base = automaticBaselineValue(fan.index) {
+            // A machine that rests on the forced value is indistinguishable from
+            // one being held, and spinning for ten seconds to say so helps
+            // nobody. Clearing `Ftst` is what actually returns control there.
+            guard abs(base - Self.forcedModeValue) >= 0.001 else { return true }
+            return abs(fan.modeRaw - base) < 0.001
         }
+
+        // No baseline yet — this is the daemon's startup path, before anything is
+        // recorded. The best available test is "neither forced nor mid-handshake".
+        return abs(fan.modeRaw - Self.forcedModeValue) >= 0.001
+            && abs(fan.modeRaw - Self.midHandshakeModeValue) >= 0.001
     }
 
     private func automaticBaselineValue(_ index: Int) -> Double? {

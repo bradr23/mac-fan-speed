@@ -81,8 +81,35 @@ final class FanService {
                 // let the firmware settle, so the values read are genuinely its own.
                 if let unlock = controller.unlockKeyValue(), unlock != 0 {
                     log("Ftst was \(unlock) at startup — clearing it before reading the baseline")
-                    controller.relock(force: true)
-                    Thread.sleep(forTimeInterval: 3)
+
+                    // `relock` documents its return as "nil once Ftst is
+                    // confirmed clear, or a description of why it could not be.
+                    // Never silently swallows the failure" — and this, its most
+                    // important caller, silently swallowed it. A failed clear
+                    // leaves the firmware yielded, which makes every later
+                    // capture refuse and every setTarget throw
+                    // noBaselineRecorded, with nothing in the log to say why.
+                    if let error = controller.relock(force: true) {
+                        log("WARNING: could not clear Ftst at startup: \(error). "
+                            + "Thermal management may still be handed to a process "
+                            + "that is gone, and no trustworthy baseline can be "
+                            + "read while it is. Please report this.")
+                    }
+
+                    // Wait for the firmware to actually take the fans back rather
+                    // than sleeping a guessed interval. Three seconds was shorter
+                    // than the reclaim this hardware measurably takes — restores
+                    // on the developer's Mac log 2.4-3.5 s, and
+                    // `reclaimWaitSeconds` documents ten — so the capture could
+                    // land mid-handshake, where SPEC records the mode reading 0,
+                    // and write that down as the automatic baseline. Hard rule 1a
+                    // is explicit that retrying beats guessing an interval, and
+                    // hard rule 3 forbids restoring a mode of 0.
+                    if !controller.waitForFirmwareToReclaim() {
+                        log("WARNING: the firmware had not taken the fans back "
+                            + "\(Int(FanController.reclaimWaitSeconds))s after Ftst was "
+                            + "cleared; the baseline below may be a transitional value")
+                    }
                 }
 
                 let baseline = controller.captureBaseline()

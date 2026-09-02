@@ -90,6 +90,22 @@ final class BaselineStoreTests: XCTestCase {
         XCTAssertFalse(fileExists)
     }
 
+    /// SPEC records the mode passing through 0 while the firmware takes the fans
+    /// back, and the daemon's own comment records a previous run writing exactly
+    /// that down as "automatic". Hard rule 3 then makes every restore from it an
+    /// explicitly forbidden write.
+    func testRefusesToStoreTheMidHandshakeModeValue() {
+        var writer = store()
+        writer.save([0: FanController.midHandshakeModeValue])
+        XCTAssertFalse(fileExists, "0 is a transition, not a resting mode")
+    }
+
+    func testDropsAMidHandshakeValueFoundOnDisk() throws {
+        try write(#"{"bootTime":1000,"fans":{"0":3,"1":0}}"#)
+        var reader = store()
+        XCTAssertEqual(reader.load(), [0: 3])
+    }
+
     func testNonFiniteValuesAreRejected() {
         var writer = store()
         writer.save([0: .nan, 1: .infinity])

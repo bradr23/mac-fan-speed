@@ -12,6 +12,12 @@ The fixes were then reviewed the same way, which found fourteen defects *in the
 fixes* — four of them more serious than the finding being fixed. Those are fixed
 too, and the ones that changed the shape of a fix are described below.
 
+Running `scripts/verify-safety.sh` afterwards then reported a failure that turned
+out to be the script's own doing, and auditing the script found sixteen more ways
+it could report a result that was not about the product. That audit is the last
+section here, because an acceptance gate that can lie in either direction is
+worse than no gate.
+
 ### Fixed
 
 - **Three routes could leave the fans forced while the daemon believed it owned
@@ -124,6 +130,57 @@ too, and the ones that changed the shape of a fix are described below.
   exist; and a daemon doc comment stated the opposite of the code directly
   beneath it.
 
+- **The daemon could write down a mode of 0 as "automatic".** Startup clears
+  `Ftst` when it finds it set and then captured the baseline after a fixed
+  three-second sleep — shorter than the reclaim this hardware measurably takes
+  (2.4–3.5 s in the developer's own logs, and the code's own `reclaimWaitSeconds`
+  documents ten). A capture landing inside that window reads the value the mode
+  passes *through* on its way back, which SPEC records as 0, and writes it down
+  as the resting state. Every later restore then writes `F{i}Md = 0` — the exact
+  write hard rule 3 forbids. The daemon's own comment records a previous run
+  doing this; the mitigation chosen then was the guessed sleep.
+
+  It now waits for the firmware to actually take the fans back rather than
+  guessing an interval, which is what hard rule 1a asks for, and says so in the
+  log when it does not. `BaselineStore` refuses to record 0 alongside the forced
+  value, and `fanctl probe-mode` had the same guessed three seconds.
+
+- **`waitForFirmwareToReclaim` accepted the mid-handshake value as a completed
+  handover**, so a poll landing on a transient 0 reported the fans as back —
+  which is what deletes the crash-recovery file and disarms ownership. It also
+  could never be satisfied on a Mac whose resting mode *is* the forced value, so
+  every restore there burned ten seconds and reported failure. It now waits for
+  each fan to reach its own captured baseline, and short-circuits the case it
+  cannot decide.
+
+- **The daemon started without saying it could not clear `Ftst`.** `relock`
+  documents its return as "never silently swallows the failure", and its most
+  important caller discarded it. A failed clear leaves the firmware yielded,
+  which makes every later capture refuse and every request throw
+  `noBaselineRecorded`, with nothing in the log to explain why.
+
+- **Quitting after a failsafe trip skipped the app's own blocking release.**
+  `releaseFansForShutdown` asked "is the UI in manual", when the question that
+  matters is "have I taken control and not yet had a release confirmed". Those
+  differ exactly when it counts: after a trip — or an ordinary click on Auto —
+  the mode is already Auto while the release that accompanied it is still in
+  flight, so hard rule 2 was left entirely to the daemon's disconnect backstop,
+  which starts after the process has exited. The app now tracks the debt and
+  blocks on it.
+
+- **The app could re-command manual on top of a release the daemon was still
+  executing.** Everything in the daemon is serialized on one queue and a restore
+  waits for the firmware, so a take-control request sent two seconds later queued
+  behind it and then paid the whole unlock retry. A release is now tracked while
+  in flight and manual control refuses to re-enter until it lands.
+
+- **A dead floor in the failsafe's reset point.** `resetCelsius` was
+  `max(trip - hysteresis, 40)`. The floor was unreachable in every real
+  configuration — the trip clamps to 60...95, so the reset is never below 50 —
+  and actively wrong in one artificial one, where it produced a reset *above* the
+  trip and made every tick trip and the next release. Removing it can only lower
+  the reset, which is the conservative direction.
+
 ### Changed
 
 - **The daemon's decision-making moved into value types that can actually be
@@ -140,6 +197,51 @@ too, and the ones that changed the shape of a fix are described below.
   between them. The transcription-based suite was deleted rather than kept
   beside them. Every new test was mutation-checked: reverting the behaviour it
   describes makes it fail.
+
+- **`scripts/verify-safety.sh` is substantially rewritten.** It is the gate for
+  hard rule 2, and it could report results that were not about the product in
+  both directions.
+
+  It manufactured its own failure: to make the failsafe fire without heating the
+  machine it patched the assumed critical point below idle, which moved the
+  ceiling but not the floor, so the reset point landed *above* the trip. Every
+  tick tripped and the next released, the app flapped once per poll, and it
+  happened to be mid-cycle when the harness quit — at which point the old
+  mode-based shutdown guard skipped the blocking release, the daemon's disconnect
+  restore took 3.5 s, and the script's fixed `sleep 3` read the fans half a
+  second too early and called it a failure. Four separate defects in one line of
+  output.
+
+  It could also pass without testing anything. Every fan-state assertion read
+  fan 0 only, so a second fan could stay forced through three PASSes. The
+  expected RPM for a preset was computed, printed, and never asserted. The
+  quit-release check passed whether or not the quit-release path had run. The
+  patched build's exit status was ignored, so a failed build meant testing the
+  *previous* binary — with the real 95 °C ceiling — and reporting "failsafe did
+  not fire". And it never checked that the installed root daemon matched the tree
+  it was testing, which is how a 0.5.0 app came to be tested against a 0.4.0
+  daemon with the result attributed to code that was not running.
+
+  Its own safety net was inert too: both "put the fans back whatever happens"
+  calls used `fanctl auto`, which needs root, in a script whose header says to
+  run it without sudo — silenced by a redirect and swallowed by `|| true`. They
+  now go through the daemon, which is already root. The script refuses to run as
+  root at all, because under sudo it leaves a tracked source file and the whole
+  app bundle root-owned.
+
+  Now: it refuses to run against a mismatched daemon, polls for a condition
+  instead of sleeping a guess, checks every fan, asserts the resolved RPM, proves
+  the binary under test carries the patched threshold, fails if the failsafe
+  cycles more than once, prints what it actually saw when a check fails, and
+  reports a fanless Mac — an explicitly supported configuration — as skipped
+  rather than failed.
+
+- **Two regression tests were vacuous.** `testResetIsAlwaysBelowTrip` and
+  `testEverySettableCutoffIsAtOrBelowTheDaemonCeiling` walk a `stride` over a
+  derived range. A positive stride whose upper bound is below its lower bound
+  yields nothing, so both passed by executing zero times — in exactly the
+  configuration that breaks the invariant they exist to protect. They now assert
+  the range is non-empty and count what they checked.
 
 ## 0.4.1
 

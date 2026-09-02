@@ -223,8 +223,11 @@ func probeMode(_ mon: SystemMonitor) {
         if let error = controller.relock(force: true) {
             print("  !! could not clear Ftst: \(error)")
         }
-        // The firmware takes a moment to resume control; give it one.
-        Thread.sleep(forTimeInterval: 3)
+        // Wait for the firmware to actually resume control rather than sleeping
+        // a guessed interval — three seconds is shorter than the reclaim this
+        // hardware has been measured taking, so `probe-mode` could report a
+        // mid-handshake mode as the restored one.
+        controller.waitForFirmwareToReclaim()
         let ftst = controller.unlockKeyValue() ?? -1
         printFans(mon.fans())
         print("Ftst after restore: \(fmt(ftst))"

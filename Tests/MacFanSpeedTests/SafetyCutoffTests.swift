@@ -59,12 +59,21 @@ final class SafetyCutoffTests: XCTestCase {
     }
 
     func testResetIsAlwaysBelowTrip() {
-        // Derived rather than settable, so the ordering holds by construction.
+        // The range is proven non-empty first. A positive `stride` whose upper
+        // bound sits below its lower bound yields nothing at all, so this loop
+        // passed by executing zero times in exactly the configuration that breaks
+        // the invariant — which is what verify-safety.sh's threshold patch
+        // creates (minimum 60, maximum 29).
+        XCTAssertGreaterThan(Failsafe.maximumTripCelsius, Failsafe.minimumTripCelsius)
+
+        var checked = 0
         for trip in stride(from: Failsafe.minimumTripCelsius,
                            through: Failsafe.maximumTripCelsius, by: 1) {
             let failsafe = Failsafe(tripCelsius: trip)
             XCTAssertLessThan(failsafe.resetCelsius, failsafe.tripCelsius)
+            checked += 1
         }
+        XCTAssertGreaterThan(checked, 1, "the settable range walked no values")
     }
 
     func testSettableRangeNeverReachesTheAssumedCriticalPoint() {

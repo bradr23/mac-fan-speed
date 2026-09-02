@@ -122,6 +122,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let requested = monitor.fans.map { $0.rpm(forPercent: percent) }
             out += "manualtest.baselineRPM: \(baseline.map { Int($0) })\n"
             out += "manualtest.requestedRPM: \(requested.map { Int($0) })\n"
+            // Printed so the harness can prove it is driving the binary it
+            // thinks it is. A failed rebuild used to leave the previous build in
+            // place with the real 95 °C ceiling, and the script then reported
+            // "failsafe did not fire" as a product failure.
+            out += "manualtest.tripCelsius: \(Int(monitor.settings.safetyCutoffCelsius))\n"
             FileHandle.standardError.write(Data(out.utf8))
 
             monitor.setPercent(percent)
@@ -130,13 +135,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // Give the firmware time to yield and the fans time to spin up.
             var ticks = 0
             var sawFailsafe = false
+            var trips = 0
+            var wasAuto = false
             Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { timer in
               // Scheduled on the main run loop, so this always fires on main.
               MainActor.assumeIsolated {
                 ticks += 1
                 let rpm = monitor.fans.map { Int($0.actualRPM) }
                 var line = "manualtest.t+\(ticks * 3)s rpm=\(rpm) mode=\(monitor.mode.rawValue)"
-                if monitor.mode == .auto { sawFailsafe = true }
+                let isAuto = monitor.mode == .auto
+                if isAuto {
+                    sawFailsafe = true
+                    if !wasAuto { trips += 1 }
+                }
+                wasAuto = isAuto
                 if let message = monitor.failsafeMessage {
                     sawFailsafe = true
                     line += " failsafe=\"\(message)\""
@@ -154,6 +166,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 // correct outcome when the machine is hot, and asserting on it
                 // directly beats inferring it from the fans not spinning up.
                 summary += "manualtest.failsafeFired: \(sawFailsafe)\n"
+                // A correct failsafe trips once and stays tripped until the
+                // machine is genuinely cool. Counting the transitions turns
+                // flapping — which used to be invisible in this output — into
+                // something the harness can fail on.
+                summary += "manualtest.tripCount: \(trips)\n"
                 summary += "manualtest.finalMode: \(monitor.mode.rawValue)\n"
                 summary += "manualtest.result: \(peak > want * 0.75 ? "PASS" : "FAIL")\n"
                 summary += "manualtest.quitting — the shutdown path must release the fans\n"

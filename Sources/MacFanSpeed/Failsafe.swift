@@ -69,7 +69,19 @@ struct Failsafe {
     static let staleReadingSeconds: TimeInterval = 6
 
     private(set) var tripCelsius: Double
-    var resetCelsius: Double { max(tripCelsius - Self.hysteresisCelsius, 40) }
+
+    /// The temperature manual control may resume at, one hysteresis band below
+    /// the trip.
+    ///
+    /// There used to be a `max(..., 40)` floor here. It was dead in every
+    /// reachable configuration — `tripCelsius` is `private(set)` and every route
+    /// to it goes through `clampTrip`, which pins it to 60...95, so the band puts
+    /// the reset at 50 °C at the very lowest — and it was worse than dead in one
+    /// unreachable one: with a trip below 50 it produced a reset *above* the
+    /// trip, so every tick tripped and the next released. Removing it can only
+    /// lower the reset, which is the conservative direction: a lower reset makes
+    /// resuming manual control harder, never easier.
+    var resetCelsius: Double { tripCelsius - Self.hysteresisCelsius }
 
     init(tripCelsius: Double = Failsafe.defaultTripCelsius) {
         self.tripCelsius = Self.clampTrip(tripCelsius)

@@ -239,8 +239,16 @@ final class FanMonitor: ObservableObject {
     /// fans had been returned. The one moment the app most needs to be honest
     /// about failing is this one.
     private func releaseToAutomatic(reason: String) {
+        releaseInFlight = true
         helper.setAllAuto { [weak self] error in
-            guard let self, let error else { return }
+            guard let self else { return }
+            self.releaseInFlight = false
+            guard let error else {
+                // Only a confirmed release clears the debt. A failed one leaves
+                // it standing, so the shutdown path still blocks on a retry.
+                self.controlUnconfirmed = false
+                return
+            }
             self.lastControlError = "Could not return the fans to macOS (\(reason)): \(error)"
         }
     }
@@ -427,7 +435,15 @@ final class FanMonitor: ObservableObject {
                 settings.startupMode = .auto
                 return
             }
+            // Taking control back on top of a release the daemon has not finished
+            // executing queues behind it on the daemon's serial queue and then
+            // pays the whole firmware unlock. The next poll will try again.
+            guard !releaseInFlight else {
+                lastControlError = "Still handing the fans back — try again in a moment."
+                return
+            }
             mode = .manual
+            controlUnconfirmed = true
             settings.startupMode = activePresetID == nil ? .manual : .preset
             beginControl()
             sendTargets()
@@ -437,9 +453,7 @@ final class FanMonitor: ObservableObject {
             activePresetID = nil
             failsafeMessage = nil
             settings.startupMode = .auto
-            helper.setAllAuto { [weak self] error in
-                if let error { self?.lastControlError = error }
-            }
+            releaseToAutomatic(reason: "user asked for automatic")
         }
     }
 
@@ -624,9 +638,13 @@ final class FanMonitor: ObservableObject {
 
         case .release:
             failsafeMessage = nil
-            // Resume whatever was in force before the machine got hot.
-            if settings.startupMode != .auto, helper.status.isReady {
+            // Resume whatever was in force before the machine got hot — but not
+            // while the give-back that accompanied the trip is still executing.
+            // Re-forcing on top of an in-flight restore is how the app came to
+            // oscillate faster than the firmware could follow.
+            if settings.startupMode != .auto, helper.status.isReady, !releaseInFlight {
                 mode = .manual
+                controlUnconfirmed = true
                 beginControl()
                 sendTargets()
             }
@@ -637,9 +655,16 @@ final class FanMonitor: ObservableObject {
 
     /// Hand the fans back. Called on quit; blocking, because termination will
     /// not wait for an async reply.
+    ///
+    /// Gated on whether this session still owes a release, not on the current
+    /// mode. Those differ exactly when it matters: after a failsafe trip, or an
+    /// ordinary click on Auto, `mode` is already `.auto` while the accompanying
+    /// release is still in flight — and the old `mode == .manual` guard skipped
+    /// the blocking release in precisely that window.
     func releaseFansForShutdown() {
-        guard mode == .manual else { return }
+        guard controlUnconfirmed || mode == .manual else { return }
         helper.setAllAutoSynchronously()
+        controlUnconfirmed = false
     }
 
     // MARK: Formatting
@@ -660,6 +685,28 @@ final class FanMonitor: ObservableObject {
     /// controlled". The verdict only becomes visible if it has never once been
     /// contradicted.
     private(set) var fansEverControllable = false
+
+    /// True from the moment this session takes control until a release is
+    /// *confirmed* — not merely sent.
+    ///
+    /// `releaseFansForShutdown` used to ask "is the UI in manual", which is a
+    /// different question. After a failsafe trip — or an ordinary click on Auto —
+    /// `mode` is already `.auto` while the release that accompanied it is still
+    /// in flight, so quitting skipped the blocking release entirely and left hard
+    /// rule 2 to the daemon's disconnect backstop. That backstop works, but it
+    /// starts *after* the process exits and takes seconds, which is the whole
+    /// reason the synchronous release exists.
+    private var controlUnconfirmed = false
+
+    /// True while a release is in flight, so the app cannot re-command manual on
+    /// top of a give-back the daemon is still executing.
+    ///
+    /// Everything is serialized on one queue in the daemon, and a restore waits
+    /// up to `reclaimWaitSeconds` for the firmware, so a take-control request
+    /// sent two seconds later queues behind it and then pays the full unlock
+    /// retry. Without this the app's mode could oscillate several times faster
+    /// than the hardware can follow.
+    private(set) var releaseInFlight = false
 
     var averageRPM: Double? {
         guard !fans.isEmpty else { return nil }
