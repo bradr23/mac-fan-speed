@@ -2,6 +2,31 @@
 
 Notable changes in each release. Versions follow [semantic versioning](https://semver.org).
 
+## 0.5.2
+
+### Fixed
+
+- **Refusing manual control threw away the user's startup preference.** The
+  guard added in 0.5.1 to stop the app entering a manual mode it could not act
+  on — for a Mac whose fans never report their speed limits — also wrote
+  `startupMode = .auto`, to avoid retrying a failure that could not succeed.
+
+  Two problems. It consulted only the live `hasControllableFans`, which is false
+  whenever `fans` is empty, and that includes every moment before the first
+  snapshot lands as well as any poll where the min/max read glitches — the same
+  transient the failsafe's miss tolerances exist for. And the preference it
+  rewrote was the user's. One such moment permanently discarded "start with this
+  preset", silently, on hardware that was perfectly controllable.
+
+  It was caught on the developer's own machine, which came back in Auto after a
+  helper upgrade with `startupMode` rewritten and nothing in the UI to say why.
+
+  Refusing the mode change is the whole job: the guard no longer touches stored
+  settings, and it consults `fansEverControllable`, so a single bad read cannot
+  trigger it at all. Verified across three launch cycles — the preference
+  survives and the preset is reapplied each time, where before it would have
+  been wiped on the first.
+
 ## 0.5.1
 
 ### Fixed

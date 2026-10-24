@@ -441,9 +441,25 @@ final class FanMonitor: ObservableObject {
             // hold them in, so the daemon refuses every target. Entering manual
             // there produced a mode with no effect and — because the dropdown
             // hides the controls in that state — no way back out.
-            guard hasControllableFans else {
+            //
+            // Two things were wrong with the first version of this guard, and
+            // both cost the user their configuration.
+            //
+            // It consulted only the live value, which is false whenever `fans`
+            // is empty — including every moment before the first snapshot lands,
+            // and any poll where the min/max read glitches, the same transient
+            // the failsafe's miss tolerances exist for. And it wrote
+            // `startupMode = .auto`, so one such moment silently and permanently
+            // discarded "start with this preset". That is how the developer's
+            // own machine came back in Auto after a helper upgrade, with the
+            // stored preference rewritten and nothing said about it.
+            //
+            // Refusing the mode change is the whole job. Throwing away a
+            // preference to avoid retrying a harmless failure is not a trade
+            // worth making, and `fansEverControllable` means one bad read cannot
+            // trigger it at all.
+            guard hasControllableFans || fansEverControllable else {
                 lastControlError = "This Mac's fans do not report a controllable range."
-                settings.startupMode = .auto
                 return
             }
             // Taking control back on top of a release the daemon has not finished
