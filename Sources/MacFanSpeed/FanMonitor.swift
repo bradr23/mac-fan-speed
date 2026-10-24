@@ -116,7 +116,14 @@ final class FanMonitor: ObservableObject {
 
     var unit: TemperatureUnit {
         get { settings.unit }
-        set { settings.unit = newValue; objectWillChange.send() }
+        set {
+            settings.unit = newValue
+            // The title carries the unit, and switching it does not wait for a
+            // poll — without this the menu bar kept showing °C until the next
+            // reading landed.
+            menuBarLabel.update(to: menuBarText)
+            objectWillChange.send()
+        }
     }
 
     var linkFans: Bool {
@@ -289,6 +296,10 @@ final class FanMonitor: ObservableObject {
         if samples.count > Self.historyLimit {
             samples.removeFirst(samples.count - Self.historyLimit)
         }
+
+        // Derived from the readings above, so it is recomputed here rather
+        // than on every SwiftUI pass over the scene.
+        menuBarLabel.update(to: menuBarText)
     }
 
     /// Reapply whatever was in force when the app last quit.
@@ -735,6 +746,9 @@ final class FanMonitor: ObservableObject {
         let named = SensorNaming.name(for: cpu)
         return named.isVerbatim ? named.raw : "\(named.display)  ·  \(named.raw)"
     }
+
+    /// The menu bar title, republished only when it changes. See `MenuBarLabel`.
+    let menuBarLabel = MenuBarLabel()
 
     var menuBarText: String {
         MenuBarFormatter.label(

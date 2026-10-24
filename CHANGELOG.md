@@ -73,7 +73,52 @@ Notable changes in each release. Versions follow [semantic versioning](https://s
   "anything but forced" test lacked. The decision is now a pure function with
   tests, and both of the previously shipped versions of it fail them.
 
+### Changed
+
+- **Every daemon log line is timestamped.** It was not, and diagnosing a field
+  report meant reconstructing the order of events from context, with no way to
+  tell a burst of restores seconds apart from the same lines a week apart. This
+  is the file the project asks people to paste into bug reports. Local time to
+  the millisecond, formatted with `strftime` rather than a `DateFormatter`
+  because it is called from the same serial queue as the thermal watch — 3 µs
+  per line, measured.
+
+- **The menu bar title is no longer rewritten on every poll.** `MenuBarExtra`'s
+  label was rebuilt whenever anything the scene observed changed, and the poll
+  republishes four properties every two seconds, while the title — rounded to
+  whole degrees — changes far less often. Each rebuild pushed a scene update
+  through Control Center: 99 log entries a minute at the busiest, almost all of
+  them re-publishing a string identical to the one already on screen. The title
+  now lives in a one-property observable that is assigned only when the text
+  differs, and the scene no longer observes `FanMonitor` at all. Measured
+  afterwards: 13 entries a minute, an 87% reduction.
+
+- **Sensor names, SMC keys and tiers are discovered once a minute instead of
+  every poll.** This is for robustness rather than speed, and the measurements
+  are recorded in the source so the question is not reopened: caching the
+  enumeration changed the 85 ms read time by nothing measurable, because the
+  cost is ~1.6 ms per sensor event read, 52 times. What it does buy is that a
+  transient `IOHIDEventSystemClientCopyServices` failure — long documented here
+  as something that happens on any Mac — no longer empties the whole reading.
+
 ### Not changed
+
+- **The sensor read is inherent cost, not waste.** A full read is 85 ms every
+  two seconds, which looks alarming and is not: measured over two minutes, the
+  app uses **0.32% of one core**, about 6 ms of CPU per poll. The rest is
+  blocked waiting on IOKit, on a background queue. Nor can the sensor list be
+  trimmed: sensors sharing a name are not duplicates. `PMU tdie1` appears three
+  times on a Mac16,8 with values differing by up to 0.2 °C, and `gas gauge
+  battery` appears six times under six distinct SMC keys, every one of which
+  feeds the failsafe's battery rule. Collapsing them would have discarded five
+  of six battery sensors.
+
+- **The daemon log is not rotated.** It grows at roughly 1.4 KB a day — 84 KB
+  across two months of development, far less in ordinary use. Rotation would
+  mean either a `newsyslog.d` rule, which renames the file out from under the
+  descriptor launchd opened and silently breaks logging until the daemon
+  restarts, or the daemon managing its own file descriptor and watching for the
+  inode to change. Both have a worse failure mode than the growth they prevent.
 
 - **Fans running faster than the preset asks is the escalation floor working.**
   The fans were at 6605 rpm, 77.8% of this Mac's range, with the "Quiet" preset

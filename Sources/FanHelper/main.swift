@@ -18,8 +18,36 @@ import SMCKit
 
 let helperVersion = SMCKit.version
 
+/// Local time, to the millisecond, for the log line prefix.
+///
+/// `strftime` on a `tm` from `localtime_r` rather than a `DateFormatter`: this
+/// is called from the daemon's serial queue, the same queue the thermal watch
+/// runs on, so it has to be cheap and it has to be thread-safe without a lock.
+/// Local time rather than UTC because the first thing anyone does with this file
+/// is line it up against "it started making noise at about three".
+private func logTimestamp() -> String {
+    var now = timeval()
+    gettimeofday(&now, nil)
+    var seconds = time_t(now.tv_sec)
+    var parts = tm()
+    localtime_r(&seconds, &parts)
+
+    var buffer = [CChar](repeating: 0, count: 32)
+    let written = strftime(&buffer, buffer.count, "%Y-%m-%d %H:%M:%S", &parts)
+    guard written > 0 else { return "------ --:--:--.---" }
+    return String(format: "%@.%03d", String(cString: buffer), Int(now.tv_usec) / 1000)
+}
+
+/// Every line is stamped.
+///
+/// It was not, and diagnosing a field report meant reconstructing the order of
+/// events from context alone — with no way to tell a burst of restores seconds
+/// apart from the same lines a week apart. This is the file the project asks
+/// people to paste into bug reports.
 func log(_ message: String) {
-    FileHandle.standardError.write(Data("MacFanSpeedHelper: \(message)\n".utf8))
+    FileHandle.standardError.write(
+        Data("\(logTimestamp()) MacFanSpeedHelper: \(message)\n".utf8)
+    )
 }
 
 // MARK: - Fan service

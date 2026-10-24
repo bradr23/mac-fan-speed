@@ -97,6 +97,52 @@ public final class TemperatureReader: @unchecked Sendable {
 
     private var client: CIOHIDEventSystemClientRef?
 
+    /// Everything about the sensors on this machine that cannot change between
+    /// readings, discovered once and reused.
+    ///
+    /// This is for robustness, not speed, and the measurement is worth recording
+    /// so nobody re-litigates it: a full `readAll()` is 85 ms on a Mac16,8 with
+    /// 52 sensors, and caching the enumeration changed that by nothing
+    /// measurable. The cost is ~1.6 ms per `IOHIDServiceClientCopyEvent`, 52
+    /// times — reading the sensors, not finding them. It cannot be cut by
+    /// collapsing the list either: sensors sharing a name are *not* duplicates.
+    /// On this machine `PMU tdie1` appears three times with values that differ
+    /// by up to 0.2 °C, and `gas gauge battery` appears six times under six
+    /// distinct SMC keys, all six of which feed the failsafe's battery rule.
+    ///
+    /// What this does buy: a sensor's name, SMC key and tier are properties of
+    /// the hardware, so re-deriving them every two seconds was pointless work;
+    /// and a transient `IOHIDEventSystemClientCopyServices` failure — long
+    /// documented here as something that happens on any Mac — no longer empties
+    /// the reading. The temperatures themselves are always read fresh.
+    ///
+    /// The `services` array is held deliberately. `IOHIDEventSystemClientCopyServices`
+    /// is a `Copy` function and the array owns the service references, so
+    /// keeping the references means keeping the array that owns them.
+    private struct Catalogue {
+        let services: CFArray
+        let entries: [Entry]
+        let discoveredAt: Date
+
+        struct Entry {
+            let service: CIOHIDServiceClientRef
+            let name: String
+            let tier: SensorTier
+            let smcKey: String?
+        }
+    }
+
+    private var catalogue: Catalogue?
+
+    /// How often the sensor list is rebuilt from scratch.
+    ///
+    /// Not never. Hard rule 6 says hardware is read at runtime rather than
+    /// assumed, and that applies to a list cached for the life of the process
+    /// just as much as to a constant in the source: a sensor whose name failed
+    /// to copy on the first pass would otherwise be missing forever. A minute
+    /// is 1/30th of the old cost and still re-reads everything regularly.
+    private static let rediscoverInterval: TimeInterval = 60
+
     /// The HID client is not safe to drive from two threads at once.
     private let lock = NSLock()
 
@@ -141,12 +187,60 @@ public final class TemperatureReader: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
 
-        guard let client,
-              let services = IOHIDEventSystemClientCopyServices(client)
-        else { return [] }
+        guard let entries = currentCatalogue()?.entries else { return [] }
 
         var sensors: [TemperatureSensor] = []
+        sensors.reserveCapacity(entries.count)
+
+        for entry in entries {
+            var celsius: Double = 0
+            guard CIOHIDReadTemperature(entry.service, &celsius) == 1 else { continue }
+
+            // Readings outside this range mean the sensor is not reporting a real
+            // die temperature; including them would corrupt the hottest-CPU value.
+            guard celsius > -20, celsius < 150 else { continue }
+
+            sensors.append(
+                TemperatureSensor(
+                    name: entry.name,
+                    celsius: celsius,
+                    tier: entry.tier,
+                    smcKey: entry.smcKey
+                )
+            )
+        }
+        // The catalogue is built sorted, so the output already is.
+        return sensors
+    }
+
+    /// The sensor catalogue, rebuilt if it is missing or stale.
+    ///
+    /// Must be called with `lock` held. A rebuild that finds nothing leaves the
+    /// previous catalogue in place rather than replacing it with an empty one:
+    /// `IOHIDEventSystemClientCopyServices` returning nothing is a transient
+    /// failure this project has documented for years, and discarding a working
+    /// list because of one is how a reader that was fine becomes a reader that
+    /// reports no sensors.
+    private func currentCatalogue() -> Catalogue? {
+        if let catalogue,
+           Date().timeIntervalSince(catalogue.discoveredAt) < Self.rediscoverInterval {
+            return catalogue
+        }
+        if let rebuilt = buildCatalogue() {
+            catalogue = rebuilt
+        }
+        return catalogue
+    }
+
+    /// Must be called with `lock` held.
+    private func buildCatalogue() -> Catalogue? {
+        guard let client,
+              let services = IOHIDEventSystemClientCopyServices(client)
+        else { return nil }
+
+        var entries: [Catalogue.Entry] = []
         let count = CFArrayGetCount(services)
+        entries.reserveCapacity(count)
 
         for i in 0..<count {
             guard let raw = CFArrayGetValueAtIndex(services, i) else { continue }
@@ -156,31 +250,34 @@ public final class TemperatureReader: @unchecked Sendable {
             guard CIOHIDCopySensorName(service, &nameBuffer, 256) == 1 else { continue }
             let name = String(cString: nameBuffer)
 
-            var celsius: Double = 0
-            guard CIOHIDReadTemperature(service, &celsius) == 1 else { continue }
-
             // Services with no usable name are skipped above; this catches the
             // placeholder text some dumping tools substitute for a NULL product
             // name, in case it ever arrives as a real string.
             guard !Self.ignoredNames.contains(name.lowercased()) else { continue }
 
-            // Readings outside this range mean the sensor is not reporting a real
-            // die temperature; including them would corrupt the hottest-CPU value.
-            guard celsius > -20, celsius < 150 else { continue }
-
+            // Catalogued on the strength of its name alone. Requiring a
+            // successful first temperature read here would drop a sensor that
+            // happened to be unreadable at that moment for the whole rediscover
+            // interval, where the old per-poll code retried it two seconds
+            // later. Read failures and out-of-range values are handled in
+            // `readAll`, every poll, as before.
             let keyCode = CIOHIDCopySensorKey(service)
-            let smcKey = keyCode == 0 ? nil : Self.fourCharCode(keyCode)
-
-            sensors.append(
-                TemperatureSensor(
+            entries.append(
+                Catalogue.Entry(
+                    service: service,
                     name: name,
-                    celsius: celsius,
                     tier: Self.classify(name),
-                    smcKey: smcKey
+                    smcKey: keyCode == 0 ? nil : Self.fourCharCode(keyCode)
                 )
             )
         }
-        return sensors.sorted { $0.name < $1.name }
+
+        guard !entries.isEmpty else { return nil }
+        return Catalogue(
+            services: services,
+            entries: entries.sorted { $0.name < $1.name },
+            discoveredAt: Date()
+        )
     }
 
     /// Hottest CPU temperature, using the most specific tier that matched.

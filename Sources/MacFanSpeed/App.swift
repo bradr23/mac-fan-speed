@@ -5,18 +5,33 @@ import SMCKit
 @main
 struct MacFanSpeedApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
-    @StateObject private var monitor = FanMonitor.shared
 
     var body: some Scene {
         MenuBarExtra {
-            DropdownView(monitor: monitor)
+            DropdownView(monitor: .shared)
         } label: {
-            Text(monitor.menuBarText)
-                .monospacedDigit()
+            MenuBarTitle(label: FanMonitor.shared.menuBarLabel)
         }
         // Charts and controls need a real window; the default .menu style only
         // renders native menu items.
         .menuBarExtraStyle(.window)
+    }
+}
+
+/// The scene deliberately does not observe `FanMonitor`.
+///
+/// It used to, through an `@StateObject`, which meant the whole scene — label
+/// included — was rebuilt on every poll, four times over, because each of
+/// `fans`, `cpu`, `allSensors` and `samples` publishes separately. The label
+/// observes a one-property object that changes only when the text does, and the
+/// dropdown observes the monitor itself but is only built while it is open.
+/// `FanMonitor.shared` is a singleton that owns its own lifetime, so nothing
+/// here needs to keep it alive.
+private struct MenuBarTitle: View {
+    @ObservedObject var label: MenuBarLabel
+
+    var body: some View {
+        Text(label.text).monospacedDigit()
     }
 }
 
