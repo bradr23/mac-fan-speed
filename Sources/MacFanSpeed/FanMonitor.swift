@@ -663,8 +663,17 @@ final class FanMonitor: ObservableObject {
     /// the blocking release in precisely that window.
     func releaseFansForShutdown() {
         guard controlUnconfirmed || mode == .manual else { return }
-        helper.setAllAutoSynchronously()
+        let confirmed = helper.setAllAutoSynchronously()
         controlUnconfirmed = false
+        if !confirmed {
+            // Quitting anyway is deliberate. An app that refuses to exit is a
+            // worse failure than one that leans on the daemon's disconnect
+            // restore, which is the backstop designed for a client that dies
+            // without saying goodbye — and which is what recovered the machine
+            // the one time this call did hang.
+            NSLog("MacFanSpeed: the helper did not confirm the shutdown release; "
+                + "quitting and leaving it to the daemon's disconnect restore")
+        }
     }
 
     // MARK: Formatting

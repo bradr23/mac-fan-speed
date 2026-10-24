@@ -300,12 +300,18 @@ final class FanService {
             // notification that silently never fires" is this project's most
             // repeated bug. The wake path clears it promptly; this only bounds
             // the damage if it does not.
+            //
+            // The previous timer is cancelled rather than dropped. Replacing a
+            // live one left it running, so a gate opened by sleep N+1 could be
+            // lifted early by sleep N's timer.
+            suspendTimer?.cancel()
             let timer = DispatchSource.makeTimerSource(queue: queue)
             timer.schedule(deadline: .now() + Self.suspendGateTimeout)
             timer.setEventHandler { [weak self] in
                 guard let self, self.isSuspending else { return }
                 log("no wake notification after \(Int(Self.suspendGateTimeout))s — "
-                    + "lifting the sleep gate anyway")
+                    + "lifting the sleep gate anyway (expected if the machine "
+                    + "slept for longer than that)")
                 self.isSuspending = false
             }
             timer.resume()
@@ -314,7 +320,20 @@ final class FanService {
     }
 
     /// How long the sleep gate may hold without a wake message.
-    static let suspendGateTimeout: TimeInterval = 120
+    ///
+    /// The gate exists to stop a request that was already in flight from
+    /// re-taking the fans between the restore and the machine actually going
+    /// down. That window is seconds — `IOAllowPowerChange` is called the moment
+    /// the restore returns — so the timeout only has to outlast it.
+    ///
+    /// It was 120 s, which turned out to be far too long to be harmless. The
+    /// developer's log shows 70 sleeps against 34 wake notifications and 72
+    /// expiries of this timer: the wake message usually does not arrive before
+    /// the gate times out, and every one of those cost up to two minutes in
+    /// which the daemon answered every fan request with "the machine is going to
+    /// sleep". Fifteen seconds covers the real window and bounds the damage from
+    /// a missed wake to something a user would not notice.
+    static let suspendGateTimeout: TimeInterval = 15
 
     /// Accept requests again after a wake.
     func resumeAfterWake() {

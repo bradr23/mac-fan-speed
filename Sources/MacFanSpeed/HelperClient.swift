@@ -154,17 +154,51 @@ final class HelperClient: ObservableObject {
         }
     }
 
-    /// Blocking restore for the quit path.
+    /// Blocking restore for the quit path, with a deadline.
     ///
     /// Termination will not wait for an async reply, and quitting with fans still
     /// forced is exactly what SPEC.md safety rule 2 forbids. The watchdog would
     /// catch it within 15 s, but leaving cleanly is better than relying on that.
-    func setAllAutoSynchronously() {
+    ///
+    /// The deadline is the whole point. This used to call
+    /// `synchronousRemoteObjectProxyWithErrorHandler`, which takes no timeout and
+    /// whose error handler fires only for connection-level failures — not for a
+    /// daemon that simply never replies. A user found the app wedged with its
+    /// fans held: 2480 of 2480 samples of the main thread were inside that one
+    /// call, `__NSXPCCONNECTION_IS_WAITING_FOR_A_SYNCHRONOUS_REPLY__`, reached
+    /// from the Quit button through `applicationWillTerminate`. The UI was frozen
+    /// and the app could not be quit at all. Whatever makes the daemon slow or
+    /// silent, an app must not become unquittable because of it.
+    ///
+    /// So: the asynchronous proxy, whose reply arrives on an XPC-owned queue and
+    /// therefore still lands while this thread is blocked, plus a semaphore with
+    /// a deadline. The error handler here deliberately does not touch
+    /// `@MainActor` state — this runs *on* the main thread with it blocked, so a
+    /// `Task { @MainActor in … }` could never be scheduled, and the shared
+    /// `proxy()` handler does exactly that.
+    ///
+    /// - Returns: true if the daemon confirmed before the deadline. On false the
+    ///   caller should say so and let termination proceed: the daemon releases
+    ///   the fans when the connection drops, which is measured at 2-4 s on the
+    ///   developer's hardware and is what actually recovered the wedged app.
+    ///
+    /// Five seconds is chosen from both ends. Restores on the developer's
+    /// hardware log 2.4-3.5 s, so it has to clear that or the clean path would
+    /// usually lose a race it was winning. It must not be much more: this blocks
+    /// the main thread, and at logout or restart macOS judges an app that stops
+    /// answering as one holding up the shutdown — which this app has been
+    /// accused of before.
+    @discardableResult
+    func setAllAutoSynchronously(timeout: TimeInterval = 5) -> Bool {
         guard FileManager.default.fileExists(atPath: HelperConstants.installedBinaryPath),
               let connection
-        else { return }
+        else { return false }
 
-        let proxy = connection.synchronousRemoteObjectProxyWithErrorHandler { _ in }
-        (proxy as? FanHelperProtocol)?.setAllAuto { _ in }
+        let finished = DispatchSemaphore(value: 0)
+        let proxy = connection.remoteObjectProxyWithErrorHandler { _ in finished.signal() }
+        guard let helper = proxy as? FanHelperProtocol else { return false }
+        helper.setAllAuto { _ in finished.signal() }
+
+        return finished.wait(timeout: .now() + timeout) == .success
     }
 }

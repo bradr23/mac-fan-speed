@@ -2,6 +2,65 @@
 
 Notable changes in each release. Versions follow [semantic versioning](https://semver.org).
 
+## 0.5.1
+
+### Fixed
+
+- **The app could hang on quit, with the fans still held.** Found in the field
+  after six days of uptime: the app was unresponsive, the fans were running far
+  faster than the preset asked for, and clicking Quit did nothing at all. A
+  sample of the wedged process put 2480 of 2480 main-thread samples in a single
+  stack — the Quit button, through `applicationWillTerminate`, into
+  `HelperClient.setAllAutoSynchronously()`, blocked in
+  `__NSXPCCONNECTION_IS_WAITING_FOR_A_SYNCHRONOUS_REPLY__`.
+
+  That call used `synchronousRemoteObjectProxyWithErrorHandler`, which takes no
+  timeout, and whose error handler fires only for connection-level failures —
+  not for a daemon that simply never replies. There was nothing to bound it. The
+  daemon's own log confirms it never ran that request, while its XPC connection
+  was alive and it went on to handle the disconnect restore in 2.4 s, so the
+  message was lost somewhere that no amount of daemon-side care would have
+  covered.
+
+  The release now uses the asynchronous proxy with a five-second deadline, and
+  quits regardless when it expires. Five seconds clears the 2.4-3.5 s a real
+  restore takes here, without blocking the main thread long enough for macOS to
+  judge the app as holding up a logout. If the deadline passes, the daemon's
+  disconnect restore takes over — which is what actually recovered the machine
+  when this happened. Measured after the fix: three consecutive quits at 2.8-2.9
+  seconds, each one confirmed by the daemon.
+
+  Hard rule 2 held throughout. The fans were released, 5 s after the process was
+  killed, by the backstop designed for a client that dies without saying
+  goodbye. What failed was the app's ability to exit.
+
+- **The sleep gate held for two minutes after most wakes.** The daemon refuses
+  fan requests from the start of its sleep restore until it is told the machine
+  is awake, with a timeout so that a wake message which never arrives cannot
+  latch the gate shut forever. That timeout was 120 s, and the developer's log
+  shows it doing almost all the work: 70 sleeps, 34 wake notifications, 72
+  expiries. Every one of those cost up to two minutes in which fan control
+  silently did nothing.
+
+  The window the gate actually protects is the few seconds between the restore
+  and the machine going down — `IOAllowPowerChange` is called as soon as the
+  restore returns — so the timeout is now 15 s. The message it logs no longer
+  reports a missing notification as a fault, since a machine that slept longer
+  than the timeout is the ordinary case.
+
+- **A sleep timer was replaced without being cancelled**, so the gate opened by
+  one sleep could be lifted early by the previous sleep's timer.
+
+### Not changed
+
+- **Fans running faster than the preset asks is the escalation floor working.**
+  The fans were at 6605 rpm, 77.8% of this Mac's range, with the "Quiet" preset
+  selected at 0%. The floor reaches 77.8% at 84.5 °C, and it had risen to 79.1%
+  — 84.8 °C — moments later: a hot machine, with the floor overriding a preset
+  that would have left it barely turning. That is what `ThermalGuard` is for.
+  The dropdown says so with a "raised from" caption, which was no help here
+  because the window was frozen by the bug above.
+
 ## 0.5.0
 
 Full audit of 0.4.1 — eight lenses over the whole codebase, every significant
