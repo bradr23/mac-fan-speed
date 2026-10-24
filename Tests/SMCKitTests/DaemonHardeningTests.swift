@@ -143,3 +143,69 @@ final class AuditFixTests: XCTestCase {
                           ThermalLimits.assumedCriticalCelsius)
     }
 }
+
+/// Deciding when the firmware has taken the fans back.
+///
+/// Two shipped versions of this were wrong in opposite directions: "anything but
+/// the forced value" accepted the value the handshake passes *through* as a
+/// completed handover, and "exactly the captured baseline" ran the full ten
+/// second wait and reported failure on restores that had in fact worked — six
+/// times in the field, all after a wake.
+final class ReclaimDetectionTests: XCTestCase {
+
+    private let forced = FanController.forcedModeValue      // 1
+    private let handshake = FanController.midHandshakeModeValue  // 0
+    private let resting: Double = 3
+
+    private func reclaimed(
+        mode: Double, baseline: Double? = 3, previous: Double? = nil, reported: Bool = true
+    ) -> Bool {
+        FanController.modeLooksReclaimed(
+            mode: mode, reported: reported, baseline: baseline, previousMode: previous
+        )
+    }
+
+    func testTheBaselineIsConclusiveImmediately() {
+        XCTAssertTrue(reclaimed(mode: resting))
+    }
+
+    func testAFanStillOnTheForcedValueHasNotReclaimed() {
+        XCTAssertFalse(reclaimed(mode: forced))
+        XCTAssertFalse(reclaimed(mode: forced, previous: forced))
+    }
+
+    /// The defect in "anything but forced": one poll landing mid-handshake was
+    /// read as a completed reclaim, which then deleted the crash-recovery file.
+    func testASingleMidHandshakeReadingIsNotEnough() {
+        XCTAssertFalse(reclaimed(mode: handshake))
+    }
+
+    /// The defect in "exactly the baseline": a mode that has stopped moving is
+    /// evidence even when it is not the value we hoped for. A transient cannot
+    /// be stable across two consecutive polls.
+    func testAModeThatHasStoppedMovingCounts() {
+        XCTAssertTrue(reclaimed(mode: handshake, previous: handshake))
+        XCTAssertTrue(reclaimed(mode: 2, previous: 2))
+    }
+
+    func testAMovingModeDoesNotCount() {
+        XCTAssertFalse(reclaimed(mode: handshake, previous: resting))
+        XCTAssertFalse(reclaimed(mode: 2, previous: handshake))
+    }
+
+    /// A Mac resting on the forced value can never satisfy a "not forced" test,
+    /// so the wait must not spin for ten seconds to say so.
+    func testAMacRestingOnTheForcedValueShortCircuits() {
+        XCTAssertTrue(reclaimed(mode: forced, baseline: forced))
+    }
+
+    /// The daemon's startup path has no baseline yet.
+    func testWithNoBaselineAStableNonForcedModeStillCounts() {
+        XCTAssertFalse(reclaimed(mode: resting, baseline: nil))
+        XCTAssertTrue(reclaimed(mode: resting, baseline: nil, previous: resting))
+    }
+
+    func testAnUnreportedModeIsNeverEvidence() {
+        XCTAssertFalse(reclaimed(mode: resting, previous: resting, reported: false))
+    }
+}

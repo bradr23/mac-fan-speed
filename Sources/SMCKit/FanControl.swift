@@ -466,11 +466,19 @@ public final class FanController: @unchecked Sendable {
     @discardableResult
     public func waitForFirmwareToReclaim() -> Bool {
         let deadline = Date().addingTimeInterval(Self.reclaimWaitSeconds)
+        var previous: [Int: Double] = [:]
+
         while Date() < deadline {
-            if fanReader.readAll().allSatisfy(hasReclaimed) { return true }
+            let fans = fanReader.readAll()
+            if fans.allSatisfy({ hasReclaimed($0, settledAgainst: previous) }) { return true }
+            previous = Dictionary(
+                uniqueKeysWithValues: fans.filter(\.modeReported).map { ($0.index, $0.modeRaw) }
+            )
             Thread.sleep(forTimeInterval: 0.5)
         }
-        return fanReader.readAll().allSatisfy(hasReclaimed)
+
+        let fans = fanReader.readAll()
+        return fans.allSatisfy { hasReclaimed($0, settledAgainst: previous) }
     }
 
     /// Whether one fan is back where it started.
@@ -486,21 +494,64 @@ public final class FanController: @unchecked Sendable {
     ///
     /// The captured baseline is the only exact answer, so it is used wherever one
     /// exists.
-    private func hasReclaimed(_ fan: Fan) -> Bool {
-        guard fan.modeReported else { return false }
+    /// Whether one fan is back under the firmware's control.
+    ///
+    /// Three tests, in order of how much they prove, because no single one is
+    /// right on its own and the project has now shipped two that were not.
+    ///
+    /// Returning to the captured baseline is conclusive, and is the normal case:
+    /// restores that work reach it in two to three seconds. But *requiring* it
+    /// was too strict. In the field, 0.5.0 logged six restores that ran the full
+    /// ten seconds and reported failure, all of them in the minutes after a
+    /// wake, where 0.2.0 through 0.4.0 — which asked only "is the mode no longer
+    /// the forced value" — logged none at all in the same conditions. A reported
+    /// failure is not harmless: it keeps `hasForcedFans` set, re-arms the
+    /// watchdog to retry, leaves the crash-recovery file in place, and on one
+    /// occasion the daemon took a `SIGTERM` in that state and exited saying the
+    /// fans might still be forced.
+    ///
+    /// So a fan that is off the forced value and has *stopped moving* also
+    /// counts. That is weaker evidence than the baseline, but it is real
+    /// evidence, and it is what distinguishes a settled mode from the value the
+    /// handshake passes through — which was the whole reason the old
+    /// "anything but forced" test was wrong. A transient cannot be stable across
+    /// two consecutive polls; a resting state is nothing but.
+    ///
+    /// - Parameter settledAgainst: the previous poll's modes, empty on the first.
+    private func hasReclaimed(_ fan: Fan, settledAgainst previous: [Int: Double]) -> Bool {
+        Self.modeLooksReclaimed(
+            mode: fan.modeRaw,
+            reported: fan.modeReported,
+            baseline: automaticBaselineValue(fan.index),
+            previousMode: previous[fan.index]
+        )
+    }
 
-        if let base = automaticBaselineValue(fan.index) {
-            // A machine that rests on the forced value is indistinguishable from
-            // one being held, and spinning for ten seconds to say so helps
-            // nobody. Clearing `Ftst` is what actually returns control there.
-            guard abs(base - Self.forcedModeValue) >= 0.001 else { return true }
-            return abs(fan.modeRaw - base) < 0.001
-        }
+    /// The decision behind `hasReclaimed`, as a pure function so it can be
+    /// tested — it needs no SMC handle to be wrong, and two shipped versions of
+    /// it were.
+    static func modeLooksReclaimed(
+        mode: Double,
+        reported: Bool,
+        baseline: Double?,
+        previousMode: Double?
+    ) -> Bool {
+        guard reported else { return false }
 
-        // No baseline yet — this is the daemon's startup path, before anything is
-        // recorded. The best available test is "neither forced nor mid-handshake".
-        return abs(fan.modeRaw - Self.forcedModeValue) >= 0.001
-            && abs(fan.modeRaw - Self.midHandshakeModeValue) >= 0.001
+        // A machine that rests on the forced value is indistinguishable from one
+        // being held, and spinning for ten seconds to say so helps nobody.
+        // Clearing `Ftst` is what actually returns control there.
+        if let baseline, abs(baseline - forcedModeValue) < 0.001 { return true }
+
+        // Still held: no further evidence can help.
+        guard abs(mode - forcedModeValue) >= 0.001 else { return false }
+
+        // Conclusive.
+        if let baseline, abs(mode - baseline) < 0.001 { return true }
+
+        // Off the forced value and unchanged since the last poll: settled.
+        guard let previousMode else { return false }
+        return abs(mode - previousMode) < 0.001
     }
 
     private func automaticBaselineValue(_ index: Int) -> Double? {

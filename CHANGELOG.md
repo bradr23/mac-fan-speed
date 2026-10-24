@@ -51,6 +51,28 @@ Notable changes in each release. Versions follow [semantic versioning](https://s
 - **A sleep timer was replaced without being cancelled**, so the gate opened by
   one sleep could be lifted early by the previous sleep's timer.
 
+- **Restores reported failure on fans that had come back.** 0.5.0 tightened the
+  test for "the firmware has taken the fans back" from "the mode is no longer
+  the forced value" to "the mode has returned to the captured baseline". Too
+  tight: the developer's daemon log records six restores under 0.5.0 that ran
+  the full ten-second wait and reported failure, every one of them in the
+  minutes after a wake, against none at all under 0.2.0 through 0.4.0 across the
+  bulk of the same log.
+
+  A reported failure is not cosmetic. It keeps `hasForcedFans` set, re-arms the
+  watchdog to retry, leaves the crash-recovery file in place — and on one
+  occasion the daemon was sent `SIGTERM` while in that state and exited logging
+  "the fans may still be forced", which is the one outcome hard rule 2 exists to
+  prevent.
+
+  The baseline is still conclusive and still the normal case, reached in two to
+  three seconds. What is added is a second, weaker form of evidence: a mode that
+  is off the forced value and has not changed since the previous poll has
+  *settled*, and a value the handshake is passing through cannot be stable
+  across two consecutive polls. That was the real distinction the original
+  "anything but forced" test lacked. The decision is now a pure function with
+  tests, and both of the previously shipped versions of it fail them.
+
 ### Not changed
 
 - **Fans running faster than the preset asks is the escalation floor working.**
